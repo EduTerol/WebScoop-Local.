@@ -1,0 +1,33 @@
+name: Preparar WebScoop Linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  preparar:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Instalar Node 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Descargar WebScoop
+        run: git clone https://github.com/MIDILLI-Tech/WebScoop.git webscoop
+
+      - name: Instalar dependencias
+        working-directory: webscoop
+        run: |
+          npm ci --ignore-scripts --no-audit
+          npm rebuild better-sqlite3
+
+      - name: Comprimir dependencias
+        run: tar -czf webscoop-linux-deps.tar.gz -C webscoop node_modules
+
+      - name: Guardar paquete
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-linux-deps
+          path: webscoop-linux-deps.tar.gz
+          retention-days: 7
+          compression-level: 0
