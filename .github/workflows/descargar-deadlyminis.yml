@@ -1,0 +1,44 @@
+name: Descargar Deadly Minis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  descargar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Instalar Node 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Instalar Chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium
+
+      - name: Descargar WebScoop
+        run: git clone https://github.com/MIDILLI-Tech/WebScoop.git webscoop
+
+      - name: Instalar dependencias
+        working-directory: webscoop
+        run: npm ci --ignore-scripts --no-audit
+
+      - name: Capturar Deadly Minis
+        working-directory: webscoop
+        run: |
+          timeout 900s npm run cli -- 'https://deadlyminis.com/?model=vampire' --js --chromium-path /usr/bin/chromium --domain same-domain -d 2 -p 80 -c 2 --delay 500 -o ../deadlyminis-local || true
+
+      - name: Comprimir captura
+        run: |
+          mkdir -p deadlyminis-local
+          tar -czf deadlyminis-captura.tar.gz deadlyminis-local
+
+      - name: Descargar resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlyminis-captura
+          path: deadlyminis-captura.tar.gz
+          retention-days: 7
+          compression-level: 0
