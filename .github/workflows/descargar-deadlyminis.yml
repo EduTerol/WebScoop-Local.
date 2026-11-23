@@ -28,8 +28,7 @@ jobs:
       - name: Capturar Deadly Minis
         working-directory: webscoop
         run: |
-          timeout 900s npm run cli -- 'https://deadlyminis.com/?model=vampire' --js --chromium-path /usr/bin/chromium --domain same-domain -d 2 -p 80 -c 2 --delay 500 -o ../deadlyminis-local || true
-
+timeout 900s npm run cli -- 'https://deadlyminis.com/?model=vampire' --js --chromium-path /usr/bin/chromium --domain any -d 1 -p 100 -c 2 --delay 500 -o ../deadlyminis-local || true
       - name: Comprimir captura
         run: |
           mkdir -p deadlyminis-local
