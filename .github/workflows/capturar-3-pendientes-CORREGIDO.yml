@@ -1,0 +1,68 @@
+name: Capturar tres modelos pendientes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capturar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Instalar Node 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Preparar navegador
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium
+          mkdir -p captura
+          npm init -y >/dev/null
+          npm install puppeteer-core --no-audit --no-fund
+          cat > capturar.cjs <<'JS'
+          const puppeteer=require('puppeteer-core');
+          const fs=require('fs');
+          const names=['wraith','zombie','cultist'];
+          const log=[];
+          (async()=>{
+          const browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage']});
+          try {
+            for(const name of names){
+              const page=await browser.newPage();
+              const item={name,requests:[],saved:[]};log.push(item);
+              const jobs=[];
+              page.on('response',response=>{
+                const url=response.url();
+                if(url.includes('/minis/')||url.includes('miniModels')){
+                  item.requests.push({url,status:response.status()});
+                  if(url.includes('/minis/')&&url.includes('.bin')&&response.ok()){
+                    const job=response.buffer().then(data=>{
+                      const model=url.match(/\/minis\/([^/]+)\/[^/]+\.bin/);
+                      if(model){const file=model[1]+'.bin';fs.writeFileSync('captura/'+file,data);item.saved.push(file)}
+                    }).catch(e=>item.error=String(e));
+                    jobs.push(job);
+                  }
+                }
+              });
+              try{
+                await page.goto('https://deadlyminis.com/?model='+encodeURIComponent(name),{waitUntil:'domcontentloaded',timeout:60000});
+                await new Promise(r=>setTimeout(r,7000));
+                const found=await page.evaluate(()=>({url:location.href,title:document.title,cards:[...document.querySelectorAll('[data-testid^="mini-card-"]')].map(x=>x.getAttribute('data-testid'))}));
+                Object.assign(item,found);
+                await page.screenshot({path:'captura/'+name+'.png'});
+              }catch(e){item.error=String(e)}
+              await Promise.allSettled(jobs);
+              await page.close();
+            }
+          }finally{await browser.close();fs.writeFileSync('captura/resultado.json',JSON.stringify(log,null,2))}
+          })().catch(e=>{console.error(e);process.exitCode=1});
+          JS
+      - name: Visitar modelos pendientes
+        run: node capturar.cjs
+      - name: Subir resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deadlyminis-3-pendientes
+          path: captura/
+          retention-days: 7
