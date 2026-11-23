@@ -7,6 +7,7 @@ jobs:
   descargar:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+
     steps:
       - name: Instalar Node 26
         uses: actions/setup-node@v4
@@ -28,13 +29,16 @@ jobs:
       - name: Capturar Deadly Minis
         working-directory: webscoop
         run: |
-timeout 900s npm run cli -- 'https://deadlyminis.com/?model=vampire' --js --chromium-path /usr/bin/chromium --domain any -d 1 -p 100 -c 2 --delay 500 -o ../deadlyminis-local || true
+          timeout 900s npm run cli -- "https://deadlyminis.com/?model=vampire" --js --chromium-path /usr/bin/chromium --domain any -d 1 -p 100 -c 2 --delay 500 -o ../deadlyminis-local
+
       - name: Comprimir captura
+        if: always()
         run: |
           mkdir -p deadlyminis-local
           tar -czf deadlyminis-captura.tar.gz deadlyminis-local
 
-      - name: Descargar resultado
+      - name: Subir resultado
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: deadlyminis-captura
