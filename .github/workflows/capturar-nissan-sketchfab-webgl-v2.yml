@@ -1,0 +1,108 @@
+name: Nissan Sketchfab - Prueba WebGL V2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capturar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - name: Instalar Chromium y librerias graficas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium libegl1 libgl1 libgles2 mesa-utils
+      - name: Preparar capturador
+        run: |
+          mkdir -p captura
+          npm install --no-save --no-audit --no-fund puppeteer-core@24
+          cat > capturar.cjs <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const puppeteer = require('puppeteer-core');
+          const MODEL = '0875adba1a2444ef8699037c4dc6de09';
+          const PAGE = `https://sketchfab.com/3d-models/nissan-gts14-drift-${MODEL}`;
+          const OUT = path.resolve('captura');
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
+          fs.mkdirSync(path.join(OUT,'recursos'),{recursive:true});
+          const report = {page:PAGE, modelId:MODEL, started:new Date().toISOString(), resources:[], errors:[], checkpoints:[], frames:[]};
+          const seen = new Set(), jobs = new Set();
+          let bytes=0;
+          const MAX_BYTES=500*1024*1024, MAX_ITEM=80*1024*1024;
+          const allowed = url => {try {const h=new URL(url).hostname;return h==='sketchfab.com'||h.endsWith('.sketchfab.com')||h==='sketchfab-prod-media.s3.amazonaws.com'||h.endsWith('.sketchfab-prod-media.s3.amazonaws.com');} catch {return false;}};
+          const interesting = (url,mime) => /\.(?:bin|glb|gltf|obj|fbx|stl|ktx2?|basis|webp|jpe?g|png|json|zip)(?:\?|$)/i.test(url)||/model|texture|geometry|octree|image|octet-stream/i.test(url+' '+mime);
+          (async () => {
+          const browser = await puppeteer.launch({
+            executablePath:'/usr/bin/chromium',headless:true,
+            args:['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--enable-unsafe-swiftshader','--use-gl=angle','--use-angle=swiftshader','--ignore-gpu-blocklist','--window-size=1440,900']
+          });
+          try {
+            const page=await browser.newPage();
+            await page.setViewport({width:1440,height:900});
+            page.on('console',m=>{if(m.type()==='error'&&report.errors.length<100)report.errors.push('Console: '+m.text().slice(0,350));});
+            page.on('pageerror',e=>{if(report.errors.length<100)report.errors.push('Page: '+String(e).slice(0,350));});
+            page.on('requestfailed',r=>{if(report.errors.length<100)report.errors.push('Request: '+r.url()+' '+(r.failure()?.errorText||''));});
+            page.on('response',response=>{
+              const job=(async()=>{
+                const url=response.url();
+                if(!allowed(url)||seen.has(url))return;
+                seen.add(url);
+                const headers=response.headers(),mime=headers['content-type']||'';
+                const record={url,status:response.status(),mime};report.resources.push(record);
+                if(record.status!==200||!interesting(url,mime))return;
+                const length=Number(headers['content-length']||0);
+                if(length>MAX_ITEM||bytes+length>MAX_BYTES){record.skipped='size limit';return;}
+                try {
+                  const data=await response.buffer();
+                  if(data.length>MAX_ITEM||bytes+data.length>MAX_BYTES){record.skipped='size limit';return;}
+                  const ext=(path.extname(new URL(url).pathname).slice(0,10).match(/^\.[a-z0-9]{1,8}$/i)||[])[0]||'.bin';
+                  const filename=crypto.createHash('sha256').update(url).digest('hex').slice(0,24)+ext;
+                  fs.writeFileSync(path.join(OUT,'recursos',filename),data);
+                  bytes+=data.length;record.file='recursos/'+filename;record.bytes=data.length;record.signature=data.subarray(0,16).toString('hex');
+                }catch(e){record.error=String(e).slice(0,250);}
+              })();
+              jobs.add(job);job.finally(()=>jobs.delete(job));
+            });
+            try {
+              await page.goto(PAGE,{waitUntil:'domcontentloaded',timeout:90000});
+              for(const sec of [15,45,90,135]) {
+                const elapsed=report.checkpoints.length?sec-report.checkpoints.at(-1).seconds:sec;
+                await sleep(elapsed*1000);
+                const frames=page.frames().map(f=>f.url());
+                const visible=await page.evaluate(()=>document.body?.innerText?.slice(0,2500)||'').catch(()=>null);
+                const checkpoint={seconds:sec,title:await page.title(),frames,visibleText:visible,resources:report.resources.length,saved:report.resources.filter(x=>x.file).length};
+                report.checkpoints.push(checkpoint);
+                await page.screenshot({path:path.join(OUT,`captura-${sec}s.png`),fullPage:false}).catch(()=>{});
+                console.log('Checkpoint',sec,'s; respuestas:',checkpoint.resources,'guardados:',checkpoint.saved,'iframes:',frames.length);
+              }
+              report.frames=page.frames().map(f=>f.url());
+            }catch(e){report.errors.push('Navigation: '+String(e));}
+            await Promise.allSettled([...jobs]);
+          } finally {
+            report.finished=new Date().toISOString();report.savedBytes=bytes;
+            fs.writeFileSync(path.join(OUT,'informe.json'),JSON.stringify(report,null,2));
+            await browser.close();
+          }
+          console.log('FINAL: respuestas',report.resources.length,'archivos',report.resources.filter(x=>x.file).length,'bytes',bytes);
+          })().catch(e => { console.error('ERROR DE CAPTURA:', e); fs.writeFileSync(path.join(OUT,'error.txt'),String(e.stack||e)); process.exitCode=1; });
+          JS
+      - name: Capturar Nissan con espera prolongada
+        run: timeout 240s node capturar.cjs
+      - name: Empaquetar resultado
+        if: always()
+        run: |
+          mkdir -p captura
+          tar -czf nissan-webgl-v2.tar.gz captura
+      - name: Publicar resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissan-webgl-v2
+          path: nissan-webgl-v2.tar.gz
+          retention-days: 7
+          compression-level: 0
