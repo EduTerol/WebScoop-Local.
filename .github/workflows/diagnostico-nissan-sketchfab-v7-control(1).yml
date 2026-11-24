@@ -1,0 +1,98 @@
+name: Nissan Sketchfab V7 - Control e inicializacion
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostico:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Preparar Node y Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium >/dev/null
+          npm install --no-save puppeteer-core@24
+      - name: Ejecutar bateria V7
+        shell: bash
+        run: |
+          cat > diagnostico-v7.cjs <<'JS'
+          const fs = require('fs');
+          const puppeteer = require('puppeteer-core');
+          const MODEL='0875adba1a2444ef8699037c4dc6de09';
+          const CONTROL='7w7pAfrCfjovwykkEeRFLGw5SXS'; // ejemplo de la documentacion oficial
+          const dir='resultados-v7'; fs.mkdirSync(dir,{recursive:true});
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          const output={version:'7',model:MODEL,control:CONTROL,tests:[],notes:[]};
+          const safeUrl=u=>{try {let x=new URL(u);return x.origin+x.pathname;}catch{return String(u).slice(0,200)}};
+          const interesting=(s)=>/waf|challenge|captcha|blocked|access denied|security|sketchfab|fallback|viewer|model|error|glb|gltf|bin|geometry|scene/i.test(s);
+          async function inspect(browser,label,url,click=false){
+            const page=await browser.newPage();
+            await page.setViewport({width:1365,height:900,deviceScaleFactor:1});
+            const r={label,url,requests:[],responses:[],console:[],pageErrors:[],failures:[],frames:[],snapshots:[],securityIndicators:[]};
+            page.on('request',q=>{if(r.requests.length<500)r.requests.push({url:safeUrl(q.url()),type:q.resourceType(),method:q.method()})});
+            page.on('requestfailed',q=>r.failures.push({url:safeUrl(q.url()),error:q.failure()?.errorText}));
+            page.on('console',m=>{if(r.console.length<100)r.console.push({type:m.type(),text:m.text().slice(0,600)})});
+            page.on('pageerror',e=>r.pageErrors.push(String(e).slice(0,900)));
+            page.on('response',async res=>{
+              const h=res.headers(),u=res.url(),ct=h['content-type']||'';
+              const entry={url:safeUrl(u),status:res.status(),type:ct,server:h.server||null,via:h.via||null,cache:h['x-cache']||null,contentLength:h['content-length']||null};
+              if(r.responses.length<500)r.responses.push(entry);
+              if(/waf|captcha|challenge|blocked/i.test(u+' '+JSON.stringify(h)))r.securityIndicators.push(entry);
+              if(/\/i\/models\/[^/]+\/fallback|\/i\/browser-support/.test(u)){
+                try {entry.body=(await res.text()).slice(0,1500)}catch(e){entry.bodyError=String(e)}
+              }
+            });
+            try {const resp=await page.goto(url,{waitUntil:'domcontentloaded',timeout:45000});r.navigationStatus=resp?.status()??null}
+            catch(e){r.navigationError=String(e)}
+            for(const seconds of [8,25,50]){
+              await sleep(seconds===8?8000:seconds===25?17000:25000);
+              if(click&&seconds===8){try{await page.mouse.click(680,420);r.clicked=true}catch(e){r.clickError=String(e)}}
+              try{
+                const snapshot=await page.evaluate(()=>({title:document.title,readyState:document.readyState,bodyText:document.body?.innerText?.slice(0,1600),iframeCount:document.querySelectorAll('iframe').length,iframes:[...document.querySelectorAll('iframe')].map(f=>({src:f.getAttribute('src')?.split('?')[0],sandbox:f.getAttribute('sandbox')})),canvasCount:document.querySelectorAll('canvas').length,scriptCount:document.scripts.length,visibility:document.visibilityState,performanceResources:performance.getEntriesByType('resource').length}));
+                r.snapshots.push({seconds,...snapshot});
+              }catch(e){r.snapshots.push({seconds,error:String(e)})}
+              try{await page.screenshot({path:`${dir}/${label}-${seconds}s.png`,fullPage:false,timeout:12000})}catch(e){r.screenshotError=String(e)}
+            }
+            r.frames=page.frames().map(f=>({url:safeUrl(f.url()),name:f.name()}));
+            try{r.cookiesSummary=(await page.cookies()).map(c=>({domain:c.domain,name:c.name,httpOnly:c.httpOnly,secure:c.secure}));}catch{}
+            r.summary={responses:r.responses.length,failed:r.failures.length,jsErrors:r.pageErrors.length,securityIndicators:r.securityIndicators.length,geometryCandidates:r.responses.filter(x=>/\.(glb|gltf|bin|obj|fbx)(\?|$)|model\/gltf|octet-stream/i.test(x.url+' '+x.type)).length};
+            await page.close();output.tests.push(r);return r;
+          }
+          async function main(){
+            const browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader','--window-size=1365,900']});
+            try{
+              const targets=[
+                ['nissan-embed',`https://sketchfab.com/models/${MODEL}/embed?autostart=1&preload=1`,false],
+                ['control-embed',`https://sketchfab.com/models/${CONTROL}/embed?autostart=1&preload=1`,false],
+                ['nissan-page',`https://sketchfab.com/3d-models/nissan-gts14-drift-${MODEL}`,true]
+              ];
+              for(const [label,url,click] of targets){try{await inspect(browser,label,url,click)}catch(e){output.notes.push(label+': '+String(e))}}
+              // Public Viewer API: observe documented init callbacks, without intercepting private internals.
+              const page=await browser.newPage();
+              const events=[];
+              page.on('console',m=>events.push({console:m.text().slice(0,400)}));
+              const html=`<!doctype html><meta charset="utf-8"><script src="https://static.sketchfab.com/api/sketchfab-viewer-1.12.1.js"></script><iframe id="viewer" width="1000" height="700" allow="autoplay; fullscreen; xr-spatial-tracking" allowfullscreen></iframe><script>window.v7={events:[]};function log(s){window.v7.events.push(s)};window.addEventListener('load',()=>{try{let client=new Sketchfab(document.getElementById('viewer'));client.init('${MODEL}',{autostart:1,preload:1,success:api=>{log('init-success');api.addEventListener('viewerready',()=>log('viewerready'));api.addEventListener('modelLoadProgress',x=>log('modelLoadProgress:'+x));api.start()},error:()=>log('init-error')})}catch(e){log('exception:'+String(e))}})</script>`;
+              await page.setContent(html,{waitUntil:'load',timeout:30000}).catch(e=>events.push({loadError:String(e)}));
+              await sleep(35000);
+              output.viewerApi={events, state:await page.evaluate(()=>window.v7||null).catch(e=>({error:String(e)})),frames:page.frames().map(f=>safeUrl(f.url()))};
+              await page.screenshot({path:`${dir}/viewer-api-35s.png`}).catch(()=>{});
+              await page.close();
+            }finally{await browser.close()}
+            fs.writeFileSync(`${dir}/informe-v7.json`,JSON.stringify(output,null,2));
+            let lines=['SKETCHFAB NISSAN - V7 CONTROL E INICIALIZACION','Modelo Nissan: '+MODEL,'Control oficial: '+CONTROL,''];
+            for(const t of output.tests){lines.push(t.label+': HTTP '+t.navigationStatus+'; '+JSON.stringify(t.summary));for(const s of t.snapshots)lines.push('  '+s.seconds+'s: '+JSON.stringify({text:s.bodyText?.slice(0,250),canvas:s.canvasCount,iframes:s.iframeCount}));}
+            lines.push('Viewer API: '+JSON.stringify(output.viewerApi?.state||{}));lines.push('Aviso: un control que tampoco carga indica un problema del entorno, no del Nissan.');
+            fs.writeFileSync(`${dir}/RESUMEN.txt`,lines.join('\n'));
+            process.stdout.write(lines.join('\n')+'\n');
+          }
+          main().catch(e=>{fs.writeFileSync(`${dir}/error.txt`,String(e.stack||e));process.exitCode=1});
+          JS
+          node diagnostico-v7.cjs
+      - name: Subir informes y capturas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissan-diagnostico-v7
+          path: resultados-v7/
+          if-no-files-found: warn
