@@ -1,0 +1,53 @@
+name: WebScoop V9 - Diagnostico GPU Sketchfab
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostico:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Instalar Chromium y Puppeteer
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium libgl1-mesa-dri mesa-utils >/dev/null
+          npm install --no-save puppeteer-core@24
+      - name: Ejecutar bateria V9
+        shell: bash
+        run: |
+          cat > webscoop-v9.cjs <<'JS'
+          const fs=require('fs'),http=require('http'),puppeteer=require('puppeteer-core');
+          const ID='0875adba1a2444ef8699037c4dc6de09', CONTROL='7w7pAfrCfjovwykkEeRFLGw5SXS';
+          const OUT='resultados-v9';fs.mkdirSync(OUT,{recursive:true});
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          const modes=[
+           {name:'angle-swiftshader',args:['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']},
+           {name:'angle-default',args:['--use-gl=angle','--enable-unsafe-swiftshader']},
+           {name:'egl-mesa',args:['--use-gl=egl','--enable-unsafe-swiftshader']}
+          ];
+          const report={version:9,model:ID,control:CONTROL,started:new Date().toISOString(),modes:[]};
+          const safe=s=>{try{let u=new URL(s);return u.origin+u.pathname}catch{return String(s).slice(0,200)}};
+          const script=`<!doctype html><html><head><meta charset="utf-8"><title>WebScoop V9</title></head><body><iframe id="viewer" width="1150" height="750" allow="autoplay; fullscreen" allowfullscreen></iframe><script src="https://static.sketchfab.com/api/sketchfab-viewer-1.12.1.js"></script><script>
+          window.__events=[];window.__record=(name,args)=>window.__events.push({name,args:JSON.stringify(args).slice(0,1000),at:Date.now()});
+          window.addEventListener('load',()=>{try{if(typeof Sketchfab==='undefined'){__record('missing-script',[]);return}const model=new URLSearchParams(location.search).get('model');new Sketchfab(document.getElementById('viewer')).init(model,{autostart:1,preload:1,success:api=>{__record('init-success',[]);for(const n of ['viewerready','modelLoadStart','modelLoadProgress','modelLoadEnd','error'])try{api.addEventListener(n,(...a)=>__record(n,a))}catch(e){__record('listener-exception',[String(e)])}try{api.start()}catch(e){__record('start-exception',[String(e)])}},error:(...a)=>__record('init-error',a)})}catch(e){__record('exception',[String(e)])}});
+          </script></body></html>`;
+          function probe(){return (()=>{const out={userAgent:navigator.userAgent,platform:navigator.platform,webgl:{}};for(const type of ['webgl','webgl2']){try{const c=document.createElement('canvas'),gl=c.getContext(type);if(!gl){out.webgl[type]={available:false};continue}const dbg=gl.getExtension('WEBGL_debug_renderer_info');out.webgl[type]={available:true,vendor:gl.getParameter(gl.VENDOR),renderer:gl.getParameter(gl.RENDERER),version:gl.getParameter(gl.VERSION),shading:gl.getParameter(gl.SHADING_LANGUAGE_VERSION),unmaskedVendor:dbg?gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL):null,unmaskedRenderer:dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):null,maxTextureSize:gl.getParameter(gl.MAX_TEXTURE_SIZE),maxVertexAttribs:gl.getParameter(gl.MAX_VERTEX_ATTRIBS),maxVertexUniformVectors:gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS),maxFragmentUniformVectors:gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS),maxVaryingVectors:gl.getParameter(gl.MAX_VARYING_VECTORS),extensions:gl.getSupportedExtensions()||[]}}catch(e){out.webgl[type]={error:String(e)}}}return out})()}
+          async function runMode(mode){const r={mode:mode.name,launchArgs:mode.args,tests:[],errors:[]};report.modes.push(r);let browser;try{browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--window-size=1280,800',...mode.args]})}catch(e){r.launchError=String(e);return}
+           const server=http.createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});res.end(script)});await new Promise(ok=>server.listen(0,'127.0.0.1',ok));const port=server.address().port;
+           try{for(const [name,id] of [['nissan',ID],['control',CONTROL]]){const t={name,id,events:[],responses:[],failures:[],console:[],errors:[],frames:[]};r.tests.push(t);let page;try{page=await browser.newPage();await page.setViewport({width:1280,height:850});page.on('response',x=>{if(t.responses.length<400)t.responses.push({url:safe(x.url()),status:x.status(),type:x.headers()['content-type']||''})});page.on('requestfailed',x=>t.failures.push({url:safe(x.url()),error:x.failure()?.errorText}));page.on('console',x=>{if(t.console.length<80)t.console.push({type:x.type(),message:x.text().slice(0,350)})});page.on('pageerror',x=>t.errors.push(String(x).slice(0,700)));
+           await page.goto(`http://127.0.0.1:${port}/?model=${id}`,{waitUntil:'load',timeout:40000});for(const sec of [12,30]){await sleep(sec===12?12000:18000);const frames=[];for(const f of page.frames()){try{const data=await f.evaluate(probe);const text=await f.evaluate(()=>document.body?.innerText?.slice(0,350)||'');frames.push({url:safe(f.url()),gpu:data,text})}catch(e){frames.push({url:safe(f.url()),error:String(e)})}}t.frames.push({second:sec,frames});t.events=await page.evaluate(()=>window.__events||[]).catch(()=>[]);if(sec===30)await page.screenshot({path:`${OUT}/${mode.name}-${name}.png`,timeout:10000}).catch(()=>{})}
+           }catch(e){t.testError=String(e.stack||e)}finally{if(page)await page.close().catch(()=>{})}}
+           }finally{server.close();await browser.close().catch(()=>{})}}
+          (async()=>{for(const mode of modes)await runMode(mode);report.finished=new Date().toISOString();fs.writeFileSync(`${OUT}/informe-v9.json`,JSON.stringify(report,null,2));let lines=['WEBSCOOP V9 - DIAGNOSTICO GRAFICO Y API',''];for(const m of report.modes){lines.push('MODO '+m.mode+(m.launchError?' | ERROR '+m.launchError:''));for(const t of m.tests){lines.push(`  ${t.name}: eventos=${JSON.stringify(t.events.map(e=>e.name+':'+e.args))} respuestas=${t.responses.length} fallos=${t.failures.length} erroresJS=${t.errors.length}`);for(const s of t.frames){const f=s.frames.find(x=>x.url.includes('sketchfab.com'))||s.frames[0];lines.push(`    ${s.second}s ${f?.url} ${JSON.stringify(f?.gpu?.webgl?.webgl||f?.error||{})}`)}}}fs.writeFileSync(`${OUT}/RESUMEN.txt`,lines.join('\n'));console.log(lines.join('\n'))})().catch(e=>{fs.writeFileSync(`${OUT}/ERROR.txt`,String(e.stack||e));process.exitCode=1});
+          JS
+          node --check webscoop-v9.cjs
+          node webscoop-v9.cjs
+      - name: Subir resultados V9
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-sketchfab-v9
+          path: resultados-v9/
+          if-no-files-found: warn
