@@ -1,0 +1,108 @@
+name: WebScoop V8 - Flujo de carga Sketchfab
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostico:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Instalar Chromium y Puppeteer
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium >/dev/null
+          npm install --no-save puppeteer-core@24
+      - name: Ejecutar diagnostico V8
+        shell: bash
+        run: |
+          cat > webscoop-v8.cjs <<'JS'
+          const fs=require('fs'),http=require('http'),crypto=require('crypto'),puppeteer=require('puppeteer-core');
+          const ID='0875adba1a2444ef8699037c4dc6de09';
+          const CONTROL='7w7pAfrCfjovwykkEeRFLGw5SXS';
+          const OUT='resultados-v8';fs.mkdirSync(OUT,{recursive:true});
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          const safeUrl=s=>{try{const u=new URL(s);return u.origin+u.pathname}catch{return String(s).slice(0,200)}};
+          const isCandidate=(url,ct)=>/\.(glb|gltf|bin|obj|fbx|ktx2?|basis|dds|zip)(\?|$)|model\/gltf|application\/octet-stream|geometry|\/files\//i.test(url+' '+ct);
+          const redactText=t=>String(t).replace(/(token|authorization|session|cookie|secret|key)(["'=:\s]+)[^\s&"']+/ig,'$1$2[REDACTED]').slice(0,3000);
+          const report={version:8,model:ID,control:CONTROL,started:new Date().toISOString(),tests:[],notes:[]};
+          function instrument(page,label){
+           const r={label,requests:[],responses:[],failures:[],console:[],errors:[],messages:[],frames:[],snapshots:[],candidateFiles:[]};
+           page.on('request',req=>{if(r.requests.length<700)r.requests.push({url:safeUrl(req.url()),type:req.resourceType(),method:req.method(),initiator:req.initiator?.()?.type||null})});
+           page.on('requestfailed',req=>r.failures.push({url:safeUrl(req.url()),failure:req.failure()?.errorText}));
+           page.on('console',m=>{if(r.console.length<180)r.console.push({type:m.type(),text:redactText(m.text()).slice(0,900)})});
+           page.on('pageerror',e=>r.errors.push(redactText(e.stack||e)));
+           page.on('frameattached',f=>r.frames.push({event:'attached',name:f.name(),url:safeUrl(f.url())}));
+           page.on('framenavigated',f=>r.frames.push({event:'navigated',name:f.name(),url:safeUrl(f.url())}));
+           page.on('response',async resp=>{
+            const url=resp.url(),h=resp.headers(),ct=h['content-type']||'',row={url:safeUrl(url),status:resp.status(),contentType:ct,length:h['content-length']||null,location:h.location?safeUrl(h.location):null};
+            if(r.responses.length<700)r.responses.push(row);
+            if(/\/i\/models\/[^/]+\/fallback|\/i\/browser-support|\/v3\/models\/[^/]+$/.test(url)){
+             try{row.publicBody=redactText(await resp.text()).slice(0,1800)}catch(e){row.bodyError=String(e)}
+            }
+            if(isCandidate(url,ct)){
+             const candidate={...row};r.candidateFiles.push(candidate);
+             if(resp.ok()&&!/html|javascript|json/i.test(ct)){
+              try{const data=await resp.buffer();if(data.length<=25*1024*1024){const sha=crypto.createHash('sha256').update(data).digest('hex');candidate.sha256=sha;candidate.bytes=data.length;const ext=(url.match(/\.(glb|gltf|bin|obj|fbx|ktx2?|basis|dds|zip)(?:\?|$)/i)||[])[1]||'bin';const filename=`${label}-${sha.slice(0,16)}.${ext}`;fs.writeFileSync(`${OUT}/${filename}`,data);candidate.file=filename}else candidate.note='Archivo >25MB, solo metadatos'}catch(e){candidate.error=String(e)}
+             }
+            }
+           });
+           return r;
+          }
+          async function snapshot(page,r,second){
+           const frames=[];for(const f of page.frames()){
+            try{frames.push(await f.evaluate(()=>{let gl=null;try{const c=document.createElement('canvas');const x=c.getContext('webgl2')||c.getContext('webgl');gl=x?{version:x.getParameter(x.VERSION),renderer:x.getParameter(x.RENDERER),vendor:x.getParameter(x.VENDOR)}:null}catch(e){gl={error:String(e)}}return{url:location.origin+location.pathname,ready:document.readyState,title:document.title,text:(document.body?.innerText||'').slice(0,600),canvases:document.querySelectorAll('canvas').length,iframes:document.querySelectorAll('iframe').length,gl,resources:performance.getEntriesByType('resource').length,scriptCount:document.scripts.length}}))}catch(e){frames.push({url:safeUrl(f.url()),error:String(e)})}}
+           r.snapshots.push({second,frames});
+           try{await page.screenshot({path:`${OUT}/${r.label}-${second}s.png`,timeout:10000})}catch(e){r.screenshotError=String(e)}
+          }
+          async function test(browser,label,url,click){
+           const page=await browser.newPage();await page.setViewport({width:1280,height:800});
+           const r=instrument(page,label);r.url=url;
+           await page.evaluateOnNewDocument(()=>{window.__wsMessages=[];window.addEventListener('message',e=>{try{const data=typeof e.data==='string'?e.data.slice(0,600):JSON.stringify(e.data).slice(0,600);if(window.__wsMessages.length<100)window.__wsMessages.push({origin:e.origin,data})}catch{}})});
+           try{const nav=await page.goto(url,{waitUntil:'domcontentloaded',timeout:45000});r.http=nav?.status()??null}catch(e){r.navigationError=String(e)}
+           for(const s of [10,30,55]){await sleep(s===10?10000:s===30?20000:25000);if(click&&s===10){try{await page.mouse.click(640,380)}catch{}}await snapshot(page,r,s)}
+           try{r.messages=await page.evaluate(()=>window.__wsMessages||[])}catch{}
+           r.summary={responses:r.responses.length,requests:r.requests.length,failures:r.failures.length,jsErrors:r.errors.length,candidates:r.candidateFiles.length};
+           report.tests.push(r);await page.close();return r;
+          }
+          async function testOfficialAPI(browser){
+           const html=`<!doctype html><html><head><meta charset="utf-8"><title>V8 Viewer API</title></head><body><iframe id="api-frame" width="1100" height="720" allow="autoplay; fullscreen" allowfullscreen></iframe><script src="https://static.sketchfab.com/api/sketchfab-viewer-1.12.1.js"></script><script>
+           window.__events=[];function record(event,data){window.__events.push({event,data:typeof data==='string'?data.slice(0,600):JSON.stringify(data||null).slice(0,600),time:Date.now()})}
+           window.addEventListener('message',e=>{if(window.__events.length<150)record('postMessage '+e.origin,typeof e.data==='string'?e.data.slice(0,180):'[object]')});
+           window.addEventListener('load',()=>{try{if(typeof Sketchfab==='undefined'){record('missing Sketchfab script');return}const client=new Sketchfab(document.getElementById('api-frame'));client.init('${ID}',{autostart:1,preload:1,ui_controls:1,success:api=>{record('init-success');for(const event of ['viewerready','modelLoadProgress','modelLoadStart','modelLoadEnd','error']){try{api.addEventListener(event,(...args)=>{record(event,args);if(event==='viewerready'){api.getSceneGraph((err,data)=>record('sceneGraph',err?String(err):data));api.getMaterialList((err,data)=>record('materials',err?String(err):data));api.getCameraLookAt((err,data)=>record('camera',err?String(err):data))}})}catch(e){record('listener-error',String(e))}}try{api.start()}catch(e){record('start-error',String(e))}},error:(...args)=>record('init-error',args)})}catch(e){record('exception',String(e))}});
+           </script></body></html>`;
+           const server=http.createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});res.end(html)});
+           await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+           const port=server.address().port;const page=await browser.newPage();await page.setViewport({width:1280,height:800});const r=instrument(page,'api-localhost');
+           try{await page.goto(`http://127.0.0.1:${port}/`,{waitUntil:'load',timeout:35000}).catch(e=>r.navigationError=String(e));for(const s of [12,35,60]){await sleep(s===12?12000:s===35?23000:25000);await snapshot(page,r,s)}r.apiEvents=await page.evaluate(()=>window.__events||[]).catch(e=>[{error:String(e)}]);r.summary={responses:r.responses.length,failures:r.failures.length,errors:r.errors.length,candidates:r.candidateFiles.length,apiEvents:r.apiEvents.map(x=>x.event)}}finally{await page.close();server.close()}
+           report.tests.push(r);
+          }
+          async function main(){
+           const browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader','--window-size=1280,800']});
+           try{
+            for(const [label,url,click] of [
+             ['nissan-embed',`https://sketchfab.com/models/${ID}/embed?autostart=1&preload=1`,false],
+             ['control-embed',`https://sketchfab.com/models/${CONTROL}/embed?autostart=1&preload=1`,false],
+             ['nissan-page',`https://sketchfab.com/3d-models/nissan-gts14-drift-${ID}`,true]]){
+             try{await test(browser,label,url,click)}catch(e){report.notes.push(label+': '+String(e.stack||e))}
+            }
+            try{await testOfficialAPI(browser)}catch(e){report.notes.push('api-localhost: '+String(e.stack||e))}
+           }finally{await browser.close()}
+           report.finished=new Date().toISOString();fs.writeFileSync(`${OUT}/informe-v8.json`,JSON.stringify(report,null,2));
+           const lines=['WEBSCOOP - V8 DIAGNOSTICO DE FLUJO SKETCHFAB','Nissan '+ID,'Control '+CONTROL,''];
+           for(const t of report.tests){lines.push(t.label+': '+JSON.stringify(t.summary||{}));for(const s of t.snapshots||[])lines.push('  '+s.second+'s '+JSON.stringify(s.frames.map(f=>({url:f.url,text:f.text?.slice(0,100),canvases:f.canvases,gl:!!f.gl,resources:f.resources}))));if(t.apiEvents)lines.push('  eventos '+JSON.stringify(t.apiEvents.map(e=>e.event)));if(t.candidateFiles?.length)lines.push('  candidatos '+JSON.stringify(t.candidateFiles))}
+           lines.push('','NOTAS',...report.notes,'','Los archivos guardados son solo respuestas recibidas de recursos publicos; no se eluden autenticacion ni controles de acceso.');
+           fs.writeFileSync(`${OUT}/RESUMEN.txt`,lines.join('\n'));process.stdout.write(lines.join('\n')+'\n');
+          }
+          main().catch(e=>{fs.writeFileSync(`${OUT}/error.txt`,String(e.stack||e));process.exitCode=1});
+          JS
+          node --check webscoop-v8.cjs
+          node webscoop-v8.cjs
+      - name: Publicar informe y capturas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-sketchfab-v8
+          path: resultados-v8/
+          if-no-files-found: warn
