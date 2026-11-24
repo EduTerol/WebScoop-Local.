@@ -1,0 +1,128 @@
+name: Nissan Sketchfab - Bateria de pruebas V4
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pruebas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Preparar herramientas
+        run: |
+          mkdir -p resultados
+          python3 --version
+          curl --version | head -1
+
+      - name: Ejecutar pruebas HTTP publicas
+        run: |
+          cat > pruebas.py <<'PY'
+          import json, urllib.request, urllib.error, time, pathlib, re
+          ID='0875adba1a2444ef8699037c4dc6de09'
+          PAGE=f'https://sketchfab.com/3d-models/nissan-gts14-drift-{ID}'
+          tests=[
+            ('01_ficha', PAGE),
+            ('02_metadatos_api', f'https://api.sketchfab.com/v3/models/{ID}'),
+            ('03_oembed', f'https://sketchfab.com/oembed?url={urllib.parse.quote(PAGE, safe="")}'),
+            ('04_iframe_directo', f'https://sketchfab.com/models/{ID}/embed?autostart=1'),
+            ('05_descarga_oficial_sin_sesion', f'https://api.sketchfab.com/v3/models/{ID}/download'),
+            ('06_compatibilidad_navegador', 'https://sketchfab.com/i/browser-support'),
+            ('07_fallback', 'https://sketchfab.com/fallback'),
+          ]
+          out=pathlib.Path('resultados'); report=[]
+          for name,url in tests:
+            item={'prueba':name,'url':url}
+            try:
+              req=urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0 (compatible; PublicDiagnostic/1.0)','Accept':'application/json,text/html;q=0.9,*/*;q=0.5'})
+              try:
+                response=urllib.request.urlopen(req,timeout=25)
+              except urllib.error.HTTPError as err:
+                response=err
+              with response:
+                item['status']=response.status
+                item['content_type']=response.headers.get('Content-Type','')
+                item['content_length_header']=response.headers.get('Content-Length')
+                body=response.read(512*1024)
+                item['bytes_muestra']=len(body)
+                if 'json' in item['content_type']:
+                  try:
+                    data=json.loads(body)
+                    if name=='02_metadatos_api':
+                      item['datos_modelo']={k:data.get(k) for k in ('uid','name','isDownloadable','isProtected','license','faceCount','vertexCount','textureCount','materialCount','viewerUrl')}
+                    else:
+                      item['campos_json']=list(data)[:30] if isinstance(data,dict) else []
+                      item['mensaje']=str(data.get('detail',data.get('error','')))[:500] if isinstance(data,dict) else ''
+                  except Exception as e: item['json_error']=str(e)
+                else:
+                  item['titulo_html']=re.findall(r'<title[^>]*>(.*?)</title>',body.decode('utf-8','replace'),re.I|re.S)[:1]
+                (out/(name+'.txt')).write_text(body[:8000].decode('utf-8','replace'),encoding='utf-8')
+            except Exception as e:
+              item['error']=str(e)
+            report.append(item)
+            print(name, item.get('status','ERROR'),item.get('content_type',''),item.get('mensaje',''))
+            time.sleep(1)
+          (out/'informe-http.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+          PY
+          python3 pruebas.py
+
+      - name: Instalar Chromium y dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium >/dev/null
+          npm install --no-save --no-audit --no-fund puppeteer-core@24
+
+      - name: Diagnosticar solicitudes reales del visor
+        run: |
+          cat > visor.cjs <<'JS'
+          const fs=require('fs');
+          const puppeteer=require('puppeteer-core');
+          const id='0875adba1a2444ef8699037c4dc6de09';
+          const out='resultados';
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          (async()=>{
+            const browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--enable-unsafe-swiftshader','--use-gl=angle','--use-angle=swiftshader']});
+            try{
+              const page=await browser.newPage();
+              const log={responses:[],failed:[],console:[],frames:[],started:new Date().toISOString()};
+              page.on('response',r=>{if(log.responses.length<800){const h=r.headers();log.responses.push({status:r.status(),url:r.url(),type:h['content-type']||'',length:h['content-length']||''});}});
+              page.on('requestfailed',r=>{if(log.failed.length<100)log.failed.push({url:r.url(),error:r.failure()?.errorText});});
+              page.on('console',m=>{if(log.console.length<100)log.console.push({type:m.type(),message:m.text().slice(0,500)});});
+              page.on('pageerror',e=>{if(log.console.length<100)log.console.push({type:'pageerror',message:String(e).slice(0,500)});});
+              await page.goto(`https://sketchfab.com/models/${id}/embed?autostart=1`,{waitUntil:'domcontentloaded',timeout:60000});
+              for(const t of [10,30,55]){
+                await sleep(t-(log.lastTime||0)>0?(t-(log.lastTime||0))*1000:0);log.lastTime=t;
+                log.frames.push({second:t,frames:page.frames().map(f=>f.url()),responses:log.responses.length});
+                await page.screenshot({path:`${out}/visor-${t}s.png`}).catch(()=>{});
+                fs.writeFileSync(`${out}/informe-visor.json`,JSON.stringify(log,null,2));
+              }
+              console.log('Visor:',log.responses.length,'respuestas',log.failed.length,'fallos de red');
+              await page.close();
+            } finally {await browser.close();}
+          })().catch(e=>{fs.writeFileSync(`${out}/error-visor.txt`,String(e.stack||e));console.error(e);process.exitCode=1;});
+          JS
+          timeout 100s node visor.cjs
+
+      - name: Generar resumen y comprimir
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json,pathlib
+          p=pathlib.Path('resultados')
+          a=json.loads((p/'informe-http.json').read_text()) if (p/'informe-http.json').exists() else []
+          b=json.loads((p/'informe-visor.json').read_text()) if (p/'informe-visor.json').exists() else {}
+          lines=['BATERIA NISSAN SKETCHFAB - V4','', 'PRUEBAS HTTP:']
+          lines += [f"{x['prueba']}: HTTP {x.get('status','ERROR')} - {x.get('content_type',x.get('error',''))}" for x in a]
+          lines += ['',f"Visor: {len(b.get('responses',[]))} respuestas, {len(b.get('failed',[]))} peticiones fallidas",'', 'NOTA: un HTTP 401 en descarga oficial indica que requiere autenticacion. Este workflow no intenta eludirla.']
+          (p/'RESUMEN.txt').write_text('\n'.join(lines),encoding='utf-8')
+          print('\n'.join(lines))
+          PY
+          tar -czf nissan-bateria-pruebas-v4.tar.gz resultados
+
+      - name: Subir resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissan-bateria-pruebas-v4
+          path: nissan-bateria-pruebas-v4.tar.gz
+          retention-days: 7
+          compression-level: 0
