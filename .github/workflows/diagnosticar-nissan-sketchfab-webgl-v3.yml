@@ -1,0 +1,137 @@
+name: Nissan Sketchfab - Diagnostico WebGL V3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnostico:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Instalar Node 26
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Instalar Chromium y Mesa
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium libegl1 libgl1 libgles2 mesa-utils xvfb
+          chromium --version
+
+      - name: Preparar diagnostico
+        run: |
+          mkdir -p diagnostico
+          npm install --no-save --no-audit --no-fund puppeteer-core@24
+          cat > diagnostico.cjs <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const puppeteer = require('puppeteer-core');
+          const ID = '0875adba1a2444ef8699037c4dc6de09';
+          const URLS = [
+            ['ficha', `https://sketchfab.com/3d-models/nissan-gts14-drift-${ID}`],
+            ['visor-directo', `https://sketchfab.com/models/${ID}/embed?autostart=1`]
+          ];
+          const OUT = path.resolve('diagnostico');
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          fs.mkdirSync(OUT, {recursive:true});
+          const report = {modelId:ID, started:new Date().toISOString(), chromiumArgs:[], cases:[]};
+          async function run() {
+            const args = [
+              '--no-sandbox','--disable-dev-shm-usage',
+              '--enable-webgl','--enable-unsafe-swiftshader',
+              '--use-gl=angle','--use-angle=swiftshader',
+              '--ignore-gpu-blocklist','--window-size=1440,900'
+            ];
+            report.chromiumArgs = args;
+            const browser = await puppeteer.launch({
+              executablePath:'/usr/bin/chromium',headless:true,
+              args, dumpio:false
+            });
+            try {
+              for (const [name,url] of URLS) {
+                const item = {name,url,started:new Date().toISOString(),console:[],pageErrors:[],failedRequests:[],responses:[],checkpoints:[]};
+                report.cases.push(item);
+                const page = await browser.newPage();
+                await page.setViewport({width:1440,height:900});
+                page.on('console',msg => {
+                  if(item.console.length<100) item.console.push({type:msg.type(),text:msg.text().slice(0,700)});
+                });
+                page.on('pageerror',err => {
+                  if(item.pageErrors.length<70) item.pageErrors.push(String(err.stack||err).slice(0,1200));
+                });
+                page.on('requestfailed',req => {
+                  if(item.failedRequests.length<100) item.failedRequests.push({url:req.url(),error:req.failure()?.errorText});
+                });
+                page.on('response',res => {
+                  if(item.responses.length<400) item.responses.push({
+                    url:res.url(),status:res.status(),
+                    mime:(res.headers()['content-type']||'').slice(0,90)
+                  });
+                });
+                const probe = async frame => {
+                  try {
+                    return await frame.evaluate(() => {
+                      const result = {url:location.href, title:document.title,
+                        bodyText:(document.body?.innerText||'').slice(0,900)};
+                      for (const kind of ['webgl2','webgl']) {
+                        try {
+                          const canvas=document.createElement('canvas');
+                          const gl=canvas.getContext(kind);
+                          if(!gl){result[kind]={available:false};continue;}
+                          const debug=gl.getExtension('WEBGL_debug_renderer_info');
+                          result[kind]={available:true,version:gl.getParameter(gl.VERSION),
+                            vendor:gl.getParameter(gl.VENDOR),
+                            renderer:gl.getParameter(gl.RENDERER),
+                            unmaskedRenderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):null};
+                        } catch(e){result[kind]={error:String(e)};}
+                      }
+                      return result;
+                    });
+                  } catch(e) {return {url:frame.url(),error:String(e)};}
+                };
+                try {
+                  await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+                  for(const seconds of [10,35,70]) {
+                    const prev=item.checkpoints.at(-1)?.seconds||0;
+                    await sleep((seconds-prev)*1000);
+                    const frames=page.frames();
+                    const data={seconds,frameCount:frames.length,frames:[]};
+                    for(const frame of frames.slice(0,8)) data.frames.push(await probe(frame));
+                    data.responses=item.responses.length;
+                    data.failedRequests=item.failedRequests.length;
+                    item.checkpoints.push(data);
+                    await page.screenshot({path:path.join(OUT,`${name}-${seconds}s.png`)}).catch(()=>{});
+                    console.log(name,seconds+'s','frames:',frames.length,'responses:',data.responses,'failed:',data.failedRequests);
+                    fs.writeFileSync(path.join(OUT,'informe.json'),JSON.stringify(report,null,2));
+                  }
+                } catch(e) {item.fatalError=String(e.stack||e);}
+                finally {await page.close().catch(()=>{});}
+              }
+            } finally {await browser.close();}
+          }
+          run().catch(e => {report.fatalError=String(e.stack||e);process.exitCode=1;})
+            .finally(() => {
+              report.finished=new Date().toISOString();
+              fs.writeFileSync(path.join(OUT,'informe.json'),JSON.stringify(report,null,2));
+              console.log('Diagnostico guardado:',report.cases.map(c=>c.name+' '+c.checkpoints.length+' comprobaciones').join('; '));
+            });
+          JS
+
+      - name: Diagnosticar WebGL e iframe
+        run: timeout 210s node diagnostico.cjs
+
+      - name: Empaquetar diagnostico
+        if: always()
+        run: |
+          mkdir -p diagnostico
+          tar -czf nissan-diagnostico-webgl-v3.tar.gz diagnostico
+
+      - name: Subir informe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissan-diagnostico-webgl-v3
+          path: nissan-diagnostico-webgl-v3.tar.gz
+          retention-days: 7
+          compression-level: 0
