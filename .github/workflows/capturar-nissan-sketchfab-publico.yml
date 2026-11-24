@@ -1,0 +1,109 @@
+name: Capturar Nissan Sketchfab sin cuenta
+
+on:
+  workflow_dispatch:
+
+jobs:
+  capturar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Preparar Node y Chromium
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Instalar Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium
+      - name: Preparar capturador
+        run: |
+          mkdir -p captura
+          npm install --no-save --no-audit --no-fund puppeteer-core@24
+          cat > capturar.cjs <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const puppeteer = require('puppeteer-core');
+          const MODEL = '0875adba1a2444ef8699037c4dc6de09';
+          const PAGE = `https://sketchfab.com/3d-models/nissan-gts14-drift-${MODEL}`;
+          const OUT = path.resolve('captura');
+          fs.mkdirSync(path.join(OUT, 'recursos'), {recursive: true});
+          const report = {page:PAGE, modelId:MODEL, started:new Date().toISOString(), resources:[], errors:[], notes:[]};
+          const seen = new Set();
+          const jobs = new Set();
+          let bytes = 0;
+          const MAX_BYTES = 300 * 1024 * 1024;
+          const MAX_ITEM = 35 * 1024 * 1024;
+          const allowedHost = host => host === 'sketchfab.com' || host.endsWith('.sketchfab.com') || host === 'sketchfab-prod-media.s3.amazonaws.com';
+          const interesting = (url, mime) => /\.(?:bin|glb|gltf|obj|fbx|stl|ktx2?|basis|webp|jpe?g|png|json|zip)(?:\?|$)/i.test(url) || /model|texture|geometry|octree|image|application\/octet-stream/i.test(url+' '+mime);
+          async function main() {
+            const browser = await puppeteer.launch({executablePath:'/usr/bin/chromium', headless:true, args:['--no-sandbox','--disable-dev-shm-usage','--use-gl=angle','--use-angle=swiftshader','--enable-webgl']});
+            try {
+              const page = await browser.newPage();
+              await page.setViewport({width:1280,height:900});
+              page.on('console',m => {if(m.type()==='error') report.errors.push('Console: '+m.text().slice(0,300));});
+              page.on('pageerror',e => report.errors.push('Page: '+String(e).slice(0,300)));
+              page.on('response', response => {
+                const task = (async () => {
+                  const url = response.url();
+                  let host;
+                  try {host = new URL(url).hostname;} catch {return;}
+                  if (!allowedHost(host) || seen.has(url)) return;
+                  seen.add(url);
+                  const headers = response.headers();
+                  const mime = headers['content-type'] || '';
+                  const record = {url, status:response.status(), mime};
+                  report.resources.push(record);
+                  if (record.status !== 200 || !interesting(url,mime)) return;
+                  const length = Number(headers['content-length']||0);
+                  if(length > MAX_ITEM || bytes+length > MAX_BYTES) {record.skipped='size limit';return;}
+                  try {
+                    const data = await response.buffer();
+                    if(data.length > MAX_ITEM || bytes+data.length > MAX_BYTES) {record.skipped='size limit';return;}
+                    const ext = (path.extname(new URL(url).pathname).slice(0,10).match(/^\.[a-z0-9]{1,8}$/i)||[])[0] || '.bin';
+                    const filename = crypto.createHash('sha256').update(url).digest('hex').slice(0,24)+ext;
+                    fs.writeFileSync(path.join(OUT,'recursos',filename),data);
+                    bytes += data.length;
+                    record.file='recursos/'+filename;
+                    record.bytes=data.length;
+                    record.signature=data.subarray(0,16).toString('hex');
+                  } catch(e) {record.error=String(e).slice(0,250);}
+                })();
+                jobs.add(task); task.finally(()=>jobs.delete(task));
+              });
+              try {
+                await page.goto(PAGE,{waitUntil:'domcontentloaded',timeout:60000});
+                await new Promise(r=>setTimeout(r,12000));
+                const iframe = await page.$('iframe[src*="sketchfab.com"]');
+                if(iframe) report.notes.push('Se detectó iframe del visor');
+                const buttons = await page.$$eval('button',nodes=>nodes.map(n=>(n.innerText||n.getAttribute('aria-label')||'').trim()).filter(Boolean).slice(0,50));
+                report.buttons=buttons;
+                report.title=await page.title();
+                await page.screenshot({path:path.join(OUT,'captura.png'),fullPage:false}).catch(()=>{});
+                await new Promise(r=>setTimeout(r,18000));
+              } catch(e) {report.errors.push('Navigation: '+String(e));}
+              await Promise.allSettled([...jobs]);
+            } finally {await browser.close();}
+          }
+          main().catch(e=>{report.errors.push('Fatal: '+String(e));process.exitCode=1;}).finally(()=>{
+            report.finished=new Date().toISOString();
+            report.savedBytes=bytes;
+            fs.writeFileSync(path.join(OUT,'informe.json'),JSON.stringify(report,null,2));
+            console.log('Recursos vistos:',report.resources.length,'guardados:',report.resources.filter(x=>x.file).length,'bytes:',bytes);
+          });
+          JS
+      - name: Capturar recursos publicos del Nissan
+        run: timeout 180s node capturar.cjs
+      - name: Empaquetar resultado
+        if: always()
+        run: |
+          tar -czf nissan-sketchfab-publico.tar.gz captura
+      - name: Publicar resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissan-sketchfab-publico
+          path: nissan-sketchfab-publico.tar.gz
+          retention-days: 7
+          compression-level: 0
