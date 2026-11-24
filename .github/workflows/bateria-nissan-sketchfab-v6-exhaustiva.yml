@@ -1,0 +1,154 @@
+name: Nissan Sketchfab - Bateria exhaustiva V6
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  auditar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Preparar Node 26 y Chromium
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Instalar herramientas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y chromium
+          npm install --no-save --no-audit --no-fund puppeteer-core@24
+
+      - name: Crear bateria de pruebas
+        run: |
+          mkdir -p informe/recursos
+          cat > bateria.cjs <<'JS'
+          const fs=require('fs'),path=require('path'),crypto=require('crypto');
+          const puppeteer=require('puppeteer-core');
+          const ID='0875adba1a2444ef8699037c4dc6de09';
+          const PAGE=`https://sketchfab.com/3d-models/nissan-gts14-drift-${ID}`;
+          const EMBED=`https://sketchfab.com/models/${ID}/embed?autostart=1`;
+          const OUT=path.resolve('informe');
+          const wait=ms=>new Promise(r=>setTimeout(r,ms));
+          const report={modelId:ID,started:new Date().toISOString(),checks:[],sessions:[],publicFiles:[],errors:[]};
+          const safeUrl=u=>{try{const x=new URL(u);return x.origin+x.pathname;}catch{return String(u).slice(0,160)}};
+          const write=()=>fs.writeFileSync(path.join(OUT,'informe.json'),JSON.stringify(report,null,2));
+          function classify(url,mime){const u=url.toLowerCase(),m=(mime||'').toLowerCase();
+            if(/\.(glb|gltf|obj|fbx|stl|ply|usdz|ktx2?|basis|bin|zip)(\?|$)/.test(u))return 'posible-modelo';
+            if(/\.(png|jpg|jpeg|webp|avif|dds)(\?|$)/.test(u))return 'imagen-o-textura';
+            if(m.includes('model/')||m.includes('application/octet-stream'))return 'binario-posible';
+            if(m.includes('javascript')||/\.js(\?|$)/.test(u))return 'javascript';
+            if(m.includes('json'))return 'json';return 'otro';}
+          async function httpCheck(name,url){const rec={name,url:safeUrl(url)};report.checks.push(rec);
+            try{const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),18000);
+              const r=await fetch(url,{signal:ctrl.signal,redirect:'follow',headers:{'user-agent':'Mozilla/5.0 (compatible; Diagnostic/1.0)'}});
+              clearTimeout(timer);rec.status=r.status;rec.finalUrl=safeUrl(r.url);rec.mime=r.headers.get('content-type');
+              rec.length=r.headers.get('content-length');const t=await r.text();rec.bodyExcerpt=t.slice(0,1800);
+              if(rec.mime?.includes('json')){try{const obj=JSON.parse(t);rec.json=obj;if(name==='metadata'){
+                rec.json={uid:obj.uid,name:obj.name,isDownloadable:obj.isDownloadable,isProtected:obj.isProtected,
+                  processingStatus:obj.processingStatus,license:obj.license,archives:obj.archives,
+                  faceCount:obj.faceCount,vertexCount:obj.vertexCount,textureCount:obj.textureCount};
+              }}catch{}}
+              if(rec.mime?.includes('html')){
+                rec.htmlHints=[...new Set((t.match(/https?:[^\s"'<>]+|\b(?:glb|gltf|bin|texture|archive|fallback|model)\b/gi)||[]).map(s=>s.slice(0,180)))].slice(0,100);
+              }
+            }catch(e){rec.error=String(e)}write();}
+          async function main(){
+            const checks=[
+              ['ficha',PAGE],['metadata',`https://api.sketchfab.com/v3/models/${ID}`],
+              ['oembed',`https://sketchfab.com/oembed?url=${encodeURIComponent(PAGE)}`],
+              ['visor',EMBED],['descarga-oficial-sin-sesion',`https://api.sketchfab.com/v3/models/${ID}/download`],
+              ['browser-support','https://sketchfab.com/i/browser-support'],
+              ['fallback',`https://sketchfab.com/i/models/${ID}/fallback`]
+            ];
+            for(const [n,u] of checks)await httpCheck(n,u);
+            const variants=[
+              {name:'swiftshader',args:['--enable-webgl','--enable-unsafe-swiftshader','--use-gl=angle','--use-angle=swiftshader','--ignore-gpu-blocklist']},
+              {name:'mesa-software',args:['--enable-webgl','--use-gl=angle','--use-angle=gl','--ignore-gpu-blocklist']}
+            ];
+            let savedBytes=0;
+            for(const variant of variants){
+              const session={variant:variant.name,requests:[],responses:[],failed:[],console:[],pageErrors:[],frames:[],networkCandidates:[]};report.sessions.push(session);
+              let browser;
+              try{
+                browser=await puppeteer.launch({headless:true,executablePath:'/usr/bin/chromium',
+                  args:['--no-sandbox','--disable-dev-shm-usage','--window-size=1440,900',...variant.args]});
+                const page=await browser.newPage();await page.setViewport({width:1440,height:900});
+                page.on('request',r=>{if(session.requests.length<600)session.requests.push({url:safeUrl(r.url()),type:r.resourceType()})});
+                page.on('requestfailed',r=>{if(session.failed.length<100)session.failed.push({url:safeUrl(r.url()),error:r.failure()?.errorText})});
+                page.on('console',m=>{if(session.console.length<100)session.console.push({type:m.type(),text:m.text().slice(0,500)})});
+                page.on('pageerror',e=>{if(session.pageErrors.length<100)session.pageErrors.push(String(e).slice(0,800))});
+                const pending=new Set();
+                page.on('response',response=>{
+                  const job=(async()=>{
+                    const url=response.url(),status=response.status(),headers=response.headers(),mime=headers['content-type']||'';
+                    const kind=classify(url,mime);const rec={url:safeUrl(url),status,mime,kind};
+                    if(session.responses.length<700)session.responses.push(rec);
+                    if(kind==='otro'||kind==='javascript'||status!==200)return;
+                    const size=Number(headers['content-length']||0);
+                    if(size>15*1024*1024||savedBytes>120*1024*1024)return;
+                    try{
+                      const body=await response.buffer();if(body.length>15*1024*1024||savedBytes+body.length>120*1024*1024)return;
+                      const sha=crypto.createHash('sha256').update(body).digest('hex');
+                      const file=`${sha.slice(0,20)}-${kind.replace(/[^a-z-]/g,'')}.dat`;
+                      fs.writeFileSync(path.join(OUT,'recursos',file),body);savedBytes+=body.length;
+                      rec.file=`recursos/${file}`;rec.bytes=body.length;rec.sha256=sha;
+                      if(kind==='posible-modelo'||kind==='binario-posible')session.networkCandidates.push(rec);
+                    }catch(e){rec.captureError=String(e).slice(0,250)}
+                  })();pending.add(job);job.finally(()=>pending.delete(job));
+                });
+                await page.goto(EMBED,{waitUntil:'domcontentloaded',timeout:60000});
+                for(const seconds of [12,35,60]){
+                  const prior=session.frames.at(-1)?.seconds||0;await wait((seconds-prior)*1000);
+                  const checkpoint={seconds,frames:[],requests:session.requests.length,responses:session.responses.length};
+                  for(const frame of page.frames().slice(0,8)){
+                    try{checkpoint.frames.push(await frame.evaluate(()=>{
+                      const o={url:location.origin+location.pathname,title:document.title,text:(document.body?.innerText||'').slice(0,350)};
+                      try{const c=document.createElement('canvas'),gl=c.getContext('webgl2')||c.getContext('webgl');o.webgl=gl?gl.getParameter(gl.RENDERER):null}catch(e){o.webglError=String(e)}return o;
+                    }))}catch(e){checkpoint.frames.push({error:String(e).slice(0,200)})}
+                  }
+                  session.frames.push(checkpoint);
+                  await page.screenshot({path:path.join(OUT,`${variant.name}-${seconds}s.png`)}).catch(()=>{});
+                  write();
+                }
+                await Promise.allSettled([...pending]);
+                await page.close();
+              }catch(e){session.error=String(e.stack||e).slice(0,1500)}
+              finally{if(browser)await browser.close().catch(()=>{});write()}
+            }
+            const summary=[];
+            summary.push('NISSAN SKETCHFAB - BATERIA V6','Modelo: '+ID,'');
+            for(const x of report.checks)summary.push(`${x.name}: HTTP ${x.status||'ERROR'} ${x.error||''}`);
+            for(const x of report.sessions){
+              summary.push(`\n${x.variant}: ${x.responses.length} respuestas, ${x.failed.length} fallos de red, ${x.networkCandidates.length} candidatos 3D`);
+              summary.push('Error de sesion: '+(x.error||'ninguno'));
+              summary.push('Errores JS: '+x.pageErrors.length);
+            }
+            summary.push('\nLos recursos recibidos por el visor NO equivalen al paquete oficial descargable.');
+            summary.push('Si /download devuelve 401, se requiere autenticacion para esa via.');
+            fs.writeFileSync(path.join(OUT,'RESUMEN.txt'),summary.join('\n'));
+          }
+          main().catch(e=>{report.errors.push(String(e.stack||e));process.exitCode=1})
+            .finally(()=>{report.finished=new Date().toISOString();write();console.log(fs.readFileSync(path.join(OUT,'RESUMEN.txt'),'utf8'))});
+          JS
+
+      - name: Ejecutar bateria exhaustiva
+        run: timeout 450s node bateria.cjs
+
+      - name: Empaquetar resultados
+        if: always()
+        run: |
+          mkdir -p informe
+          tar -czf nissan-bateria-v6.tar.gz informe
+
+      - name: Publicar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nissan-bateria-v6
+          path: nissan-bateria-v6.tar.gz
+          retention-days: 7
+          compression-level: 0
