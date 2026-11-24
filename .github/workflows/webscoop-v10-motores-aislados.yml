@@ -1,0 +1,127 @@
+name: WebScoop V10 - Motores aislados
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  motor:
+    name: ${{ matrix.engine }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        engine: [swiftshader, mesa-llvmpipe, mesa-egl, angle-opengl, angle-vulkan, mesa-zink, xvfb-gui]
+    env:
+      ENGINE: ${{ matrix.engine }}
+      MODEL_ID: 0875adba1a2444ef8699037c4dc6de09
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      GALLIUM_DRIVER: llvmpipe
+    steps:
+      - name: Preparar dependencias en runner independiente
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium xvfb mesa-utils mesa-utils-extra libegl1 libgl1-mesa-dri libgbm1 libvulkan1 mesa-vulkan-drivers vulkan-tools xauth >/dev/null
+          echo "Chromium: $(chromium --version)"
+          node --version
+          mkdir -p resultado
+          npm install --no-save --no-audit --no-fund puppeteer-core@24 >/dev/null
+      - name: Crear diagnostico
+        shell: bash
+        run: |
+          cat > diagnostico.cjs <<'NODE'
+          const puppeteer = require('puppeteer-core');
+          const fs = require('fs');
+          const http = require('http');
+          const {execFileSync} = require('child_process');
+          const engine = process.env.ENGINE;
+          const id = process.env.MODEL_ID;
+          const dir = 'resultado';
+          fs.mkdirSync(dir,{recursive:true});
+          const report = {engine,started:new Date().toISOString(),env:{DISPLAY:process.env.DISPLAY||'',GALLIUM_DRIVER:process.env.GALLIUM_DRIVER||'',MESA_LOADER_DRIVER_OVERRIDE:process.env.MESA_LOADER_DRIVER_OVERRIDE||'',VK_ICD_FILENAMES:process.env.VK_ICD_FILENAMES||''},commands:{},cases:[],notes:[]};
+          function command(cmd,args){try{return execFileSync(cmd,args,{encoding:'utf8',timeout:12000,maxBuffer:150000}).slice(0,14000)}catch(e){return String(e.message).slice(0,3000)}}
+          for(const [name,cmd,args] of [['glxinfo','glxinfo',['-B']],['eglinfo','eglinfo',['-B']],['vulkaninfo','vulkaninfo',['--summary']]]) report.commands[name]=command(cmd,args);
+          let flags=['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--ignore-gpu-blocklist','--window-size=1280,900'];
+          // No spoofing de GPU ni de capacidades. Los flags solo seleccionan backends.
+          const choices={
+            'swiftshader':['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader'],
+            'mesa-llvmpipe':['--use-gl=desktop','--disable-vulkan'],
+            'mesa-egl':['--use-gl=egl','--disable-vulkan'],
+            'angle-opengl':['--use-gl=angle','--use-angle=gl','--disable-vulkan'],
+            'angle-vulkan':['--use-gl=angle','--use-angle=vulkan','--enable-features=Vulkan'],
+            'mesa-zink':['--use-gl=desktop','--disable-vulkan'],
+            'xvfb-gui':['--use-gl=desktop','--disable-vulkan']
+          };
+          flags.push(...choices[engine]);
+          report.flags=flags;
+          const isHeadless = engine!=='xvfb-gui';
+          let browser,server;
+          function delay(ms){return new Promise(r=>setTimeout(r,ms))}
+          function capture(page,entry){
+            page.on('console',m=>{if(entry.console.length<100)entry.console.push({type:m.type(),text:m.text().slice(0,500)})});
+            page.on('pageerror',e=>{if(entry.errors.length<50)entry.errors.push(String(e).slice(0,1000))});
+            page.on('requestfailed',r=>{if(entry.failed.length<60)entry.failed.push({url:r.url().slice(0,300),error:r.failure()?.errorText})});
+            page.on('response',r=>{const url=r.url();if(entry.responses.length<300)entry.responses.push({status:r.status(),type:r.headers()['content-type']||'',url:url.slice(0,500)});});
+          }
+          async function webgl(page){return await page.evaluate(()=>{
+            function test(type){try{const c=document.createElement('canvas');const gl=c.getContext(type);if(!gl)return {available:false};const dbg=gl.getExtension('WEBGL_debug_renderer_info');return {available:true,version:gl.getParameter(gl.VERSION),vendor:gl.getParameter(gl.VENDOR),renderer:gl.getParameter(gl.RENDERER),unmaskedVendor:dbg?gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL):null,unmaskedRenderer:dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):null,extensions:gl.getSupportedExtensions(),maxTextureSize:gl.getParameter(gl.MAX_TEXTURE_SIZE)}}catch(e){return {error:String(e)}}}
+            return {webgl1:test('webgl'),webgl2:test('webgl2')};
+          })}
+          async function caseRun(label,url,wait=32000){
+            const entry={label,url,console:[],errors:[],failed:[],responses:[],events:[]};report.cases.push(entry);
+            const page=await browser.newPage();capture(page,entry);
+            try{
+              await page.setViewport({width:1280,height:900});
+              await page.goto(url,{waitUntil:'domcontentloaded',timeout:40000});
+              entry.webgl=await webgl(page);
+              await delay(wait);
+              entry.title=await page.title();
+              entry.bodyText=(await page.evaluate(()=>document.body?.innerText||'')).slice(0,2500);
+              entry.frames=page.frames().map(f=>({url:f.url().slice(0,500)}));
+              await page.screenshot({path:`${dir}/${label}.png`,fullPage:false,timeout:15000}).catch(()=>{});
+            }catch(e){entry.exception=String(e)}
+            finally{await page.close().catch(()=>{})}
+          }
+          async function main(){
+            browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:isHeadless,args:flags,timeout:40000,protocolTimeout:60000});
+            report.browserVersion=await browser.version();
+            await caseRun('nissan-embed',`https://sketchfab.com/models/${id}/embed?autostart=1&ui_controls=1`,35000);
+            // La API oficial se ejecuta desde una pagina local, sin login ni cookies inyectadas.
+            const html=`<!doctype html><html><head><meta charset="utf-8"></head><body><iframe id="api-frame" allow="autoplay; fullscreen; xr-spatial-tracking" width="1000" height="700" src="https://sketchfab.com/models/${id}/embed?api_version=1.12.1&autostart=1"></iframe><script src="https://static.sketchfab.com/api/sketchfab-viewer-1.12.1.js"></script><script>window.__events=[];window.addEventListener('error',e=>window.__events.push({type:'window-error',msg:e.message}));setTimeout(()=>{try{if(!window.Sketchfab){window.__events.push({type:'no-api-script'});return;}let client=new Sketchfab('1.12.1',document.getElementById('api-frame'));client.init('${id}',{success(api){window.__events.push({type:'init-success'});api.addEventListener('viewerready',()=>window.__events.push({type:'viewerready'}));api.addEventListener('error',(...args)=>window.__events.push({type:'api-error',args}));api.start();},error(...args){window.__events.push({type:'init-error',args})},autostart:1});}catch(e){window.__events.push({type:'exception',message:String(e)})}},2500);</script></body></html>`;
+            server=http.createServer((req,res)=>{res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});res.end(html)});
+            await new Promise(r=>server.listen(0,'127.0.0.1',r));
+            const entry={label:'api-local',url:'local',console:[],errors:[],failed:[],responses:[],events:[]};report.cases.push(entry);
+            const page=await browser.newPage();capture(page,entry);
+            try{await page.goto(`http://127.0.0.1:${server.address().port}/`,{waitUntil:'domcontentloaded',timeout:40000});entry.webgl=await webgl(page);await delay(38000);entry.events=await page.evaluate(()=>window.__events||[]);entry.frames=page.frames().map(f=>({url:f.url().slice(0,500)}));await page.screenshot({path:`${dir}/api-local.png`,timeout:15000}).catch(()=>{});}catch(e){entry.exception=String(e)}finally{await page.close().catch(()=>{})}
+          }
+          main().catch(e=>{report.fatal=String(e);process.exitCode=1}).finally(async()=>{report.finished=new Date().toISOString();fs.writeFileSync(`${dir}/informe-${engine}.json`,JSON.stringify(report,null,2));const summary={engine,flags,renderer:report.cases.map(c=>({case:c.label,webgl:c.webgl?.webgl1?.unmaskedRenderer||c.webgl?.webgl1?.renderer,events:c.events,errors:c.errors,failed:c.failed.length,geometryResponses:c.responses.filter(r=>/\.glb(?:[?#]|$)|\.gltf(?:[?#]|$)|\.bin(?:[?#]|$)|\.obj(?:[?#]|$)|octet-stream|model\/gltf/i.test(r.url+' '+r.type)).length})),fatal:report.fatal||null};fs.writeFileSync(`${dir}/RESUMEN-${engine}.json`,JSON.stringify(summary,null,2));await browser?.close().catch(()=>{});await new Promise(r=>server?server.close(r):r());});
+          NODE
+          node --check diagnostico.cjs
+      - name: Ejecutar en aislamiento
+        shell: bash
+        run: |
+          set +e
+          if [ "$ENGINE" = 'mesa-zink' ]; then
+            export GALLIUM_DRIVER=zink
+            export MESA_LOADER_DRIVER_OVERRIDE=zink
+          fi
+          if [ "$ENGINE" = 'angle-vulkan' ] || [ "$ENGINE" = 'mesa-zink' ]; then
+            ICD=$(find /usr/share/vulkan/icd.d -iname '*lvp*json' | head -1)
+            if [ -n "$ICD" ]; then export VK_ICD_FILENAMES="$ICD"; fi
+          fi
+          if [ "$ENGINE" = 'xvfb-gui' ]; then
+            xvfb-run -a -s '-screen 0 1280x900x24 +extension GLX +render -noreset' node diagnostico.cjs
+          else
+            node diagnostico.cjs
+          fi
+          echo "Exit code: $?"
+          exit 0
+      - name: Subir informe de este motor aunque falle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v10-${{ matrix.engine }}
+          path: resultado/
+          if-no-files-found: warn
+          retention-days: 14
