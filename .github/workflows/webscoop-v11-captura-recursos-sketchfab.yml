@@ -1,0 +1,101 @@
+name: WebScoop V11 - Captura recursos 3D
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  captura:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: llvmpipe
+    steps:
+      - name: Preparar Vulkan Mesa y Chromium
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium mesa-vulkan-drivers libvulkan1 vulkan-tools >/dev/null
+          npm install --no-save --no-audit --no-fund puppeteer-core@24 >/dev/null
+          mkdir -p resultado
+          ICD=$(find /usr/share/vulkan/icd.d -iname "*lvp*json" | head -1)
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+          chromium --version
+      - name: Crear capturador V11
+        shell: bash
+        run: |
+          cat > captura-v11.cjs <<'NODE'
+          const puppeteer=require('puppeteer-core');
+          const fs=require('fs'),path=require('path'),crypto=require('crypto'),http=require('http');
+          const ID='0875adba1a2444ef8699037c4dc6de09';
+          const OUT=path.resolve('resultado');fs.mkdirSync(OUT,{recursive:true});fs.mkdirSync(path.join(OUT,'recursos'),{recursive:true});
+          const report={version:11,modelId:ID,started:new Date().toISOString(),browser:null,webgl:null,events:[],requests:[],resources:[],errors:[],frames:[],scene:{},notes:[]};
+          const MAX_SINGLE=100*1024*1024,MAX_TOTAL=400*1024*1024;let total=0,browser,server;
+          const delay=ms=>new Promise(r=>setTimeout(r,ms));
+          const isCandidate=(u,h)=>/media\.sketchfab\.com|\.binz(?:[?#]|$)|\.glb(?:[?#]|$)|\.gltf(?:[?#]|$)|\.ktx2?(?:[?#]|$)|\.basis(?:[?#]|$)|\/textures?\//i.test(u)||/model\/gltf|application\/octet-stream/i.test(h['content-type']||'');
+          const sha=b=>crypto.createHash('sha256').update(b).digest('hex');
+          const clean=s=>String(s).slice(0,1200);
+          function listen(page,label){
+           page.on('pageerror',e=>report.errors.push({label,type:'pageerror',message:clean(e)}));
+           page.on('requestfailed',r=>report.errors.push({label,type:'requestfailed',url:clean(r.url()),message:r.failure()?.errorText}));
+           page.on('console',m=>{if(m.type()==='error')report.errors.push({label,type:'console',message:clean(m.text())})});
+           page.on('response',r=>{
+             const u=r.url(),h=r.headers(),type=h['content-type']||'';
+             if(report.requests.length<3000)report.requests.push({label,url:u,status:r.status(),type,bytesHeader:h['content-length']||null});
+             if(!isCandidate(u,h)||r.status()<200||r.status()>=300)return;
+             const length=Number(h['content-length']||0);
+             if(length>MAX_SINGLE||total>=MAX_TOTAL){report.resources.push({label,url:u,skipped:'size limit',length});return;}
+             const task=(async()=>{try{
+               const buf=await r.buffer();if(buf.length>MAX_SINGLE||total+buf.length>MAX_TOTAL){report.resources.push({label,url:u,skipped:'size limit after response',length:buf.length});return;}
+               const digest=sha(buf);total+=buf.length;
+               let ext=(new URL(u)).pathname.match(/\.(binz|glb|gltf|bin|ktx2?|basis|png|jpe?g|webp|avif|dds)$/i)?.[1]?.toLowerCase()||'dat';
+               const filename=`${digest.slice(0,24)}.${ext}`;const target=path.join(OUT,'recursos',filename);
+               if(!fs.existsSync(target))fs.writeFileSync(target,buf);
+               report.resources.push({label,url:u,status:r.status(),contentType:type,bytes:buf.length,sha256:digest,file:`recursos/${filename}`,magic:buf.subarray(0,24).toString('hex')});
+             }catch(e){report.resources.push({label,url:u,error:clean(e)})}})();pending.add(task);task.finally(()=>pending.delete(task));
+           });
+          }
+          const pending=new Set();
+          async function inspectGL(page){return page.evaluate(()=>{let c=document.createElement('canvas'),gl=c.getContext('webgl2')||c.getContext('webgl');if(!gl)return {available:false};let d=gl.getExtension('WEBGL_debug_renderer_info');return {available:true,renderer:gl.getParameter(gl.RENDERER),unmaskedRenderer:d?gl.getParameter(d.UNMASKED_RENDERER_WEBGL):null,version:gl.getParameter(gl.VERSION)}})}
+          async function main(){
+           const flags=['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--ignore-gpu-blocklist','--window-size=1280,900','--use-gl=angle','--use-angle=vulkan','--enable-features=Vulkan'];
+           report.flags=flags;
+           browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:flags,timeout:60000,protocolTimeout:120000});report.browser=await browser.version();
+           const page=await browser.newPage();listen(page,'embed');await page.setViewport({width:1280,height:900});
+           await page.goto(`https://sketchfab.com/models/${ID}/embed?autostart=1&ui_controls=1`,{waitUntil:'domcontentloaded',timeout:60000});
+           report.webgl=await inspectGL(page);await delay(50000);
+           report.frames=page.frames().map(f=>f.url());
+           report.embedText=(await page.evaluate(()=>document.body?.innerText||'')).slice(0,3500);
+           await page.screenshot({path:path.join(OUT,'nissan-embed.png')}).catch(()=>{});await page.close();
+           const html=`<!doctype html><meta charset="utf-8"><h2>WebScoop V11 / Sketchfab API</h2><iframe id="api-frame" width="1100" height="750" allow="autoplay; fullscreen" src="https://sketchfab.com/models/${ID}/embed?api_version=1.12.1&autostart=1"></iframe><script src="https://static.sketchfab.com/api/sketchfab-viewer-1.12.1.js"></script><script>
+           window.__events=[];window.__scene={};function log(type,data){window.__events.push({type,data:JSON.stringify(data||[]).slice(0,1200),time:Date.now()})}
+           setTimeout(()=>{try{if(!window.Sketchfab){log('api-script-missing');return;}let c=new Sketchfab('1.12.1',document.getElementById('api-frame'));c.init('${ID}',{autostart:1,success(api){log('init-success');api.addEventListener('viewerready',()=>{log('viewerready');for(const [method,key] of [['getSceneGraph','sceneGraph'],['getCameraLookAt','camera'],['getMaterialList','materials'],['getAnimations','animations']]){try{if(typeof api[method]==='function')api[method]((err,data)=>{window.__scene[key]={error:err||null,data:data||null};log(method,err||'ok')})}catch(e){log(method+'-error',String(e))}}});api.addEventListener('error',(...a)=>log('api-error',a));api.start()},error(...a){log('init-error',a)}})}catch(e){log('exception',String(e))}},1800);
+           </script>`;
+           server=http.createServer((req,res)=>{res.writeHead(200,{'content-type':'text/html; charset=utf-8'});res.end(html)});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+           const apiPage=await browser.newPage();listen(apiPage,'api');await apiPage.setViewport({width:1280,height:900});
+           await apiPage.goto(`http://127.0.0.1:${server.address().port}/`,{waitUntil:'domcontentloaded',timeout:40000});await delay(60000);
+           report.events=await apiPage.evaluate(()=>window.__events||[]);report.scene=await apiPage.evaluate(()=>window.__scene||{});
+           await apiPage.screenshot({path:path.join(OUT,'api-local.png')}).catch(()=>{});
+           await apiPage.close();await Promise.allSettled([...pending]);
+          }
+          main().catch(e=>{report.fatal=String(e);process.exitCode=1}).finally(async()=>{
+           await Promise.allSettled([...pending]);report.finished=new Date().toISOString();report.totalCapturedBytes=total;
+           report.summary={viewerready:report.events.some(e=>e.type==='viewerready'),uniqueFiles:new Set(report.resources.filter(r=>r.sha256).map(r=>r.sha256)).size,binzFiles:report.resources.filter(r=>r.file?.endsWith('.binz')).length,failedRequests:report.errors.filter(e=>e.type==='requestfailed').length};
+           fs.writeFileSync(path.join(OUT,'informe-v11.json'),JSON.stringify(report,null,2));
+           fs.writeFileSync(path.join(OUT,'RESUMEN.txt'),`WebScoop V11\nViewerready: ${report.summary.viewerready}\nArchivos unicos: ${report.summary.uniqueFiles}\n.binz recibidos: ${report.summary.binzFiles}\nBytes capturados: ${total}\nError fatal: ${report.fatal||'ninguno'}\n`);
+           fs.writeFileSync(path.join(OUT,'LEEME.txt'),'Los .binz son recursos internos de Sketchfab; no son GLB. Este artefacto documenta y conserva únicamente respuestas públicas recibidas por el navegador. No se eluden autenticación ni protecciones. Los datos de escena pueden no estar disponibles si falla la inicialización. Respeta las licencias de cada modelo.\n');
+           await browser?.close().catch(()=>{});if(server)await new Promise(r=>server.close(r));
+          });
+          NODE
+          node --check captura-v11.cjs
+      - name: Capturar y documentar
+        shell: bash
+        run: |
+          node captura-v11.cjs
+      - name: Publicar resultados aunque falle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-sketchfab-v11
+          path: resultado/
+          if-no-files-found: warn
+          retention-days: 14
