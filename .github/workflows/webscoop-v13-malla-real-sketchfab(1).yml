@@ -1,0 +1,121 @@
+name: WebScoop V13 - Malla real Nissan (ensayo GLB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: 'UID de un modelo publico y descargable de Sketchfab'
+        required: true
+        default: '0875adba1a2444ef8699037c4dc6de09'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  convertir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      MODEL_ID: ${{ inputs.model_id }}
+    steps:
+      - name: Preparar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verificar UID, licencia y permiso publico de descarga
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$MODEL_ID" =~ ^[a-fA-F0-9]{32}$ ]]; then
+            echo 'ERROR: UID no valido (32 caracteres hexadecimales)'; exit 1
+          fi
+          python3 - <<'PY'
+          import json,os,urllib.request
+          mid=os.environ['MODEL_ID']
+          req=urllib.request.Request('https://api.sketchfab.com/v3/models/'+mid,headers={'User-Agent':'WebScoop-Research/13','Accept':'application/json'})
+          with urllib.request.urlopen(req,timeout=30) as response: data=json.load(response)
+          print('Modelo:',data.get('name'))
+          print('Autor:',(data.get('user') or {}).get('displayName'))
+          print('Licencia:',(data.get('license') or {}).get('label'))
+          print('isDownloadable:', data.get('isDownloadable'))
+          print('isProtected:', data.get('isProtected'))
+          if data.get('isDownloadable') is not True:
+            raise SystemExit('ERROR: modelo no declarado descargable; no se procesa')
+          os.makedirs('resultado',exist_ok=True)
+          with open('resultado/modelo-publico.json','w') as f:
+            json.dump({k:data.get(k) for k in ('uid','name','isDownloadable','isProtected','license')},f,indent=2)
+          PY
+
+      - name: Obtener conversor experimental de codigo abierto
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/Corpocore/sfrip.git conversor
+          git -C conversor rev-parse HEAD | tee resultado/conversor-commit.txt
+          cd conversor
+          npm ci --ignore-scripts --no-audit --no-fund
+          node sfrip.mjs --help | head -35
+
+      - name: Convertir el modelo manteniendo las piezas independientes
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p resultado/modelos
+          set +e
+          timeout 1500 node conversor/sfrip.mjs "https://sketchfab.com/models/${MODEL_ID}" \
+            --merge=off --yes --out "${GITHUB_WORKSPACE}/resultado/modelos" \
+            --concurrency=2 --no-color --verbose \
+            >resultado/conversion.log 2>&1
+          status=$?
+          set -e
+          cat resultado/conversion.log | tail -100
+          echo "$status" > resultado/conversion-exit-code.txt
+          exit "$status"
+
+      - name: Comprobar que hay mallas y triangulos en el GLB
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,struct,json,glob
+          roots=glob.glob('resultado/modelos/**/*.glb',recursive=True)
+          records=[]
+          for f in roots:
+            item={'file':f,'bytes':os.path.getsize(f)}
+            try:
+              with open(f,'rb') as h:
+                header=h.read(12)
+                magic,ver,ln=struct.unpack('<4sII',header)
+                if magic!=b'glTF' or ver!=2 or ln!=os.path.getsize(f): raise ValueError('cabecera GLB invalida')
+                chunklen,chunkid=struct.unpack('<I4s',h.read(8))
+                if chunkid!=b'JSON': raise ValueError('falta JSON GLB')
+                d=json.loads(h.read(chunklen))
+              meshes=d.get('meshes',[]); accessors=d.get('accessors',[])
+              tris=0; verts=0; primitives=0
+              for m in meshes:
+                for p in m.get('primitives',[]):
+                  primitives+=1
+                  attrs=p.get('attributes',{})
+                  if 'POSITION' in attrs: verts+=accessors[attrs['POSITION']]['count']
+                  if p.get('mode',4)==4:
+                    n=accessors[p['indices']]['count'] if 'indices' in p else accessors[attrs['POSITION']]['count']
+                    tris+=n//3
+              item.update(valid=True,meshes=len(meshes),primitives=primitives,vertices=verts,triangles=tris,materials=len(d.get('materials',[])),textures=len(d.get('textures',[])),images=len(d.get('images',[])))
+              if tris==0: item['warning']='No hay triangulos comprobables'
+            except Exception as e: item.update(valid=False,error=str(e))
+            records.append(item)
+          os.makedirs('resultado',exist_ok=True)
+          with open('resultado/validacion-glb.json','w') as h:json.dump({'models':records,'status':'GLB_REAL' if any(x.get('triangles',0)>0 for x in records) else 'SIN_MALLA_VERIFICADA'},h,indent=2)
+          print(json.dumps(records,indent=2))
+          PY
+
+      - name: Guardar resultados incluso si falla el conversor
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v13-malla-real
+          path: resultado/
+          if-no-files-found: warn
+          retention-days: 7
