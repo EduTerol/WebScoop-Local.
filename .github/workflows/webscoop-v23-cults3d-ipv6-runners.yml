@@ -1,0 +1,155 @@
+name: WebScoop V23 - Cults3D IPv6 real por runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prueba_ipv6:
+    name: "IPv6 / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    timeout-minutes: 12
+    env:
+      TARGET_URL: https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature
+      CHALLENGE_HOST: brunhild.challenges.cloudflare.com
+    steps:
+      - name: Preparar entorno aislado
+        shell: bash
+        run: |
+          mkdir -p resultados
+          printf '%s\n' "Runner: $RUNNER_NAME" "OS: $RUNNER_OS" "Arch: $RUNNER_ARCH" > resultados/runner.txt
+          uname -a >> resultados/runner.txt
+          python3 --version >> resultados/runner.txt 2>&1
+          (ip -6 addr || true) > resultados/ipv6-direcciones.txt 2>&1
+          (ip -6 route || true) > resultados/ipv6-rutas.txt 2>&1
+          (cat /etc/resolv.conf || true) > resultados/dns-config.txt 2>&1
+
+      - name: Probar DNS y conectividad IPv4 e IPv6
+        shell: bash
+        run: |
+          cat > /tmp/probe_v23.py <<'PY'
+          import json, os, socket, ssl, subprocess, time, urllib.parse
+          from pathlib import Path
+          out=Path('resultados'); out.mkdir(exist_ok=True)
+          target=os.environ['TARGET_URL']; challenge=os.environ['CHALLENGE_HOST']
+          names=['cults3d.com','challenges.cloudflare.com',challenge,'www.google.com','one.one.one.one']
+          data={'target':target, 'dns':{}, 'connections':{}, 'curl':{}, 'timestamp_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+          for name in names:
+              for family, suffix in [(socket.AF_INET,'ipv4'),(socket.AF_INET6,'ipv6')]:
+                  key=f'{name}/{suffix}'
+                  try:
+                      ips=sorted({x[4][0] for x in socket.getaddrinfo(name,443,family,socket.SOCK_STREAM)})
+                      data['dns'][key]=ips
+                      checks=[]
+                      for addr in ips[:2]:
+                          try:
+                              s=socket.socket(family,socket.SOCK_STREAM); s.settimeout(5)
+                              start=time.monotonic(); s.connect((addr,443)); elapsed=round(time.monotonic()-start,3)
+                              checks.append({'address':addr,'connect':True,'seconds':elapsed}); s.close()
+                          except Exception as e:
+                              checks.append({'address':addr,'connect':False,'error':str(e)})
+                      data['connections'][key]=checks
+                  except Exception as e:
+                      data['dns'][key]={'error':str(e)}
+          for url in [target, 'https://cults3d.com/', f'https://{challenge}/', 'https://one.one.one.one/']:
+              for mode in ['-4','-6']:
+                  cmd=['curl',mode,'-sS','-L','-o','/dev/null','-w','%{http_code}|%{remote_ip}|%{time_connect}|%{time_total}|%{url_effective}', '--max-time','12', '--max-redirs','3',url]
+                  try:
+                      p=subprocess.run(cmd,capture_output=True,text=True,timeout=16)
+                      data['curl'][url+' '+mode]={'returncode':p.returncode,'result':p.stdout.strip(),'error':p.stderr.strip()[:800]}
+                  except Exception as e:
+                      data['curl'][url+' '+mode]={'error':str(e)}
+          # Real native IPv6 means successful IPv6 TCP connectivity AND IPv6 HTTPS request to known endpoint.
+          successful_v6_connections=any(i.get('connect') for k,v in data['connections'].items() if k.endswith('/ipv6') for i in v)
+          v6_https=data['curl'].get('https://one.one.one.one/ -6',{})
+          data['native_ipv6_tcp']=successful_v6_connections
+          data['native_ipv6_https']=v6_https.get('returncode')==0 and not v6_https.get('result','').startswith('000|')
+          data['can_test_browser']=bool(data['native_ipv6_tcp'] and data['native_ipv6_https'])
+          (out/'diagnostico-ipv6.json').write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding='utf-8')
+          print('IPv6 TCP:',data['native_ipv6_tcp'],'IPv6 HTTPS:',data['native_ipv6_https'],'Browser:',data['can_test_browser'])
+          PY
+          python3 /tmp/probe_v23.py
+
+      - name: Instalar Playwright si existe IPv6 real
+        shell: bash
+        run: |
+          if python3 -c 'import json; assert json.load(open("resultados/diagnostico-ipv6.json"))["can_test_browser"]'; then
+            python3 -m pip install --disable-pip-version-check playwright==1.58.0
+            python3 -m playwright install --with-deps chromium
+            echo 'BROWSER_READY=true' >> "$GITHUB_ENV"
+          else
+            echo 'No hay IPv6 nativo funcional; se omite el navegador para no repetir la V22.' | tee resultados/navegador-omitido.txt
+          fi
+
+      - name: Navegación normal a Cults3D (solo si hay IPv6 nativo)
+        if: env.BROWSER_READY == 'true'
+        shell: bash
+        run: |
+          cat > /tmp/browser_v23.py <<'PY'
+          import asyncio, json, os, time
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+          async def run():
+              out=Path('resultados'); url=os.environ['TARGET_URL']; log={'url':url,'requests_failed':[],'responses':[],'page_title':'','final_url':'','navigation_status':None,'error':None}
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True,args=['--use-angle=vulkan','--enable-unsafe-swiftshader'])
+                  ctx=await browser.new_context(viewport={'width':1440,'height':900})
+                  page=await ctx.new_page()
+                  page.on('requestfailed',lambda r:log['requests_failed'].append({'url':r.url,'failure':r.failure}))
+                  page.on('response',lambda r:log['responses'].append({'url':r.url,'status':r.status}) if len(log['responses'])<250 else None)
+                  try:
+                      r=await page.goto(url,wait_until='domcontentloaded',timeout=30000)
+                      log['navigation_status']=r.status if r else None
+                      await page.wait_for_timeout(20000)
+                      log['final_url']=page.url
+                      log['page_title']=await page.title()
+                      log['page_text_excerpt']=(await page.locator('body').inner_text(timeout=5000))[:1200]
+                      await page.screenshot(path=str(out/'captura-final.png'),full_page=False)
+                  except Exception as e:
+                      log['error']=str(e)
+                  finally:
+                      (out/'navegador.json').write_text(json.dumps(log,indent=2,ensure_ascii=False),encoding='utf8')
+                      await browser.close()
+          asyncio.run(run())
+          PY
+          python3 /tmp/browser_v23.py
+
+      - name: Resumen de diagnóstico
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json,pathlib
+          p=pathlib.Path('resultados/diagnostico-ipv6.json')
+          lines=['WebScoop V23 - Cults3D / conexión IPv6','']
+          if p.exists():
+              d=json.loads(p.read_text())
+              lines += [f'IPv6 TCP real: {d["native_ipv6_tcp"]}',f'IPv6 HTTPS real: {d["native_ipv6_https"]}',f'Navegación activada: {d["can_test_browser"]}']
+              for key,value in d['curl'].items():
+                  lines.append(f'{key}: {value}')
+          else: lines.append('Fallo previo al diagnóstico')
+          bp=pathlib.Path('resultados/navegador.json')
+          if bp.exists():
+              b=json.loads(bp.read_text()); lines.extend(['',f'HTTP página: {b.get("navigation_status")}',f'Título: {b.get("page_title")}',f'Recursos de red: {len(b.get("responses",[]))}',f'Fallos de red: {len(b.get("requests_failed",[]))}'])
+          pathlib.Path('resultados/RESUMEN.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          print('\n'.join(lines[:8]))
+          PY
+
+      - name: Publicar resultados de este runner
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v23-cults3d-${{ matrix.os }}
+          path: resultados/
+          if-no-files-found: warn
+          retention-days: 14
