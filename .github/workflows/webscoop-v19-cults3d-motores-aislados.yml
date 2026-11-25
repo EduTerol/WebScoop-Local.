@@ -1,0 +1,111 @@
+name: WebScoop V19 - Cults3D motores aislados
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostico:
+    name: ${{ matrix.engine }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        engine: [swiftshader, mesa-llvmpipe, mesa-egl, angle-opengl, angle-vulkan, mesa-zink, xvfb-gui]
+    env:
+      ENGINE: ${{ matrix.engine }}
+      TARGET_URL: https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      GALLIUM_DRIVER: llvmpipe
+    steps:
+      - name: Preparar runner exclusivo para este motor
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium xvfb xauth mesa-utils mesa-utils-extra libegl1 libgl1-mesa-dri libgbm1 libvulkan1 mesa-vulkan-drivers vulkan-tools >/dev/null
+          mkdir -p resultado
+          node --version
+          chromium --version
+          npm install --no-save --no-audit --no-fund puppeteer-core@24 >/dev/null
+      - name: Crear diagnóstico independiente
+        shell: bash
+        run: |
+          cat > diagnostico-v19.cjs <<'NODE'
+          const puppeteer = require('puppeteer-core');
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
+          const E = process.env.ENGINE;
+          const URL = process.env.TARGET_URL;
+          const DIR = 'resultado';
+          fs.mkdirSync(DIR,{recursive:true});
+          const report = {version:'V19',engine:E,target:URL,started:new Date().toISOString(),environment:{DISPLAY:process.env.DISPLAY||'',GALLIUM_DRIVER:process.env.GALLIUM_DRIVER||'',MESA_LOADER_DRIVER_OVERRIDE:process.env.MESA_LOADER_DRIVER_OVERRIDE||'',VK_ICD_FILENAMES:process.env.VK_ICD_FILENAMES||''},checks:{},requests:[],responses:[],failures:[],errors:[],console:[],files3d:[],phase:'not-started'};
+          function run(cmd,args){try{return execFileSync(cmd,args,{encoding:'utf8',timeout:12000,maxBuffer:100000}).slice(0,9000)}catch(ex){return `UNAVAILABLE: ${ex.message}`.slice(0,1500)}}
+          for(const [k,cmd,args] of [['glxinfo','glxinfo',['-B']],['eglinfo','eglinfo',['-B']],['vulkaninfo','vulkaninfo',['--summary']]])report.checks[k]=run(cmd,args);
+          const configs={
+           'swiftshader':{args:['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader'],headless:true},
+           'mesa-llvmpipe':{args:['--use-gl=desktop','--disable-vulkan'],headless:false},
+           'mesa-egl':{args:['--use-gl=egl','--disable-vulkan'],headless:false},
+           'angle-opengl':{args:['--use-gl=angle','--use-angle=gl','--disable-vulkan'],headless:false},
+           'angle-vulkan':{args:['--use-gl=angle','--use-angle=vulkan','--enable-features=Vulkan'],headless:true},
+           'mesa-zink':{args:['--use-gl=desktop','--disable-vulkan'],headless:false},
+           'xvfb-gui':{args:['--use-gl=desktop','--disable-vulkan'],headless:false}
+          };
+          const cfg=configs[E]; if(!cfg)throw Error('Configuración desconocida: '+E);
+          const flags=['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--ignore-gpu-blocklist','--window-size=1280,900',...cfg.args];report.flags=flags;
+          function pause(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
+          async function gpuInfo(page){return page.evaluate(()=>{
+           function probe(kind){try{const canvas=document.createElement('canvas');const gl=canvas.getContext(kind);if(!gl)return {supported:false};const ext=gl.getExtension('WEBGL_debug_renderer_info');return {supported:true,version:gl.getParameter(gl.VERSION),vendor:gl.getParameter(gl.VENDOR),renderer:gl.getParameter(gl.RENDERER),unmaskedRenderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):null,extensions:(gl.getSupportedExtensions()||[]).length}}catch(ex){return {error:String(ex)}}}
+           return {webgl:probe('webgl'),webgl2:probe('webgl2')};
+          })}
+          let browser;
+          async function main(){
+           report.phase='launch';browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:cfg.headless,args:flags,timeout:50000,protocolTimeout:60000});report.browserVersion=await browser.version();
+           const page=await browser.newPage();await page.setViewport({width:1280,height:900});
+           page.on('request',r=>{if(report.requests.length<450)report.requests.push({url:r.url().slice(0,700),type:r.resourceType(),method:r.method()})});
+           page.on('response',r=>{if(report.responses.length<450)report.responses.push({url:r.url().slice(0,700),status:r.status(),type:r.headers()['content-type']||'',bytes:r.headers()['content-length']||null})});
+           page.on('requestfailed',r=>{if(report.failures.length<80)report.failures.push({url:r.url().slice(0,500),error:r.failure()?.errorText})});
+           page.on('pageerror',e=>{if(report.errors.length<80)report.errors.push(String(e).slice(0,1200))});
+           page.on('console',m=>{if(report.console.length<80)report.console.push({level:m.type(),message:m.text().slice(0,500)})});
+           report.phase='navigation';try{const resp=await page.goto(URL,{waitUntil:'domcontentloaded',timeout:55000});report.navigationStatus=resp?.status()||null}catch(e){report.navigationError=String(e)}
+           report.phase='inspection';await pause(18000);
+           report.gpu=await gpuInfo(page);
+           report.page=await page.evaluate(()=>({title:document.title,url:location.href,headings:[...document.querySelectorAll('h1,h2')].map(el=>el.innerText).slice(0,15),text:(document.body?.innerText||'').slice(0,5000),iframes:[...document.querySelectorAll('iframe')].map(i=>i.src).slice(0,25),links:[...document.querySelectorAll('a[href]')].map(a=>a.href).filter(h=>/\.(stl|obj|3mf|glb|gltf|zip)([?#]|$)/i.test(h)).slice(0,80)}));
+           report.frames=page.frames().map(f=>({url:f.url().slice(0,500)}));
+           const text=(report.page.title+' '+report.page.text).toLowerCase();
+           report.access={challenge:/performing security verification|just a moment|checking your browser|verify you are human|cloudflare|verificando|comprobación de seguridad/.test(text),modelPageVisible:!(/performing security verification|just a moment|checking your browser|verify you are human/.test(text))&&(/support.smartphonr|support smartphon|nature/.test(text)),finalUrl:report.page.url};
+           report.files3d=report.responses.filter(r=>/\.(stl|obj|3mf|glb|gltf|bin|binz|zip)([?#]|$)|model\/gltf|application\/octet-stream/i.test(r.url+' '+r.type));
+           try{await page.screenshot({path:`${DIR}/captura-${E}.png`,fullPage:false,timeout:15000})}catch(e){report.screenshotError=String(e)}
+           report.phase='complete';
+          }
+          main().catch(e=>{report.fatal=String(e);process.exitCode=1}).finally(async()=>{report.finished=new Date().toISOString();fs.writeFileSync(`${DIR}/informe-${E}.json`,JSON.stringify(report,null,2));const s=[`WEB SCOOP V19 - ${E}`,`URL: ${URL}`,`Estado inicial: ${report.navigationStatus??'sin respuesta'}`,`Navegador: ${report.browserVersion||'no iniciado'}`,`Renderizador WebGL: ${report.gpu?.webgl?.unmaskedRenderer||report.gpu?.webgl?.renderer||'no disponible'}`,`Renderizador WebGL2: ${report.gpu?.webgl2?.unmaskedRenderer||report.gpu?.webgl2?.renderer||'no disponible'}`,`Protección/Verificación detectada: ${report.access?.challenge??'sin evaluar'}`,`Página del modelo detectada: ${report.access?.modelPageVisible??'sin evaluar'}`,`Respuestas: ${report.responses.length}`,`Rutas con formatos 3D: ${report.files3d.length}`,`Error fatal: ${report.fatal||'ninguno'}`,`Fase: ${report.phase}`];fs.writeFileSync(`${DIR}/RESUMEN-${E}.txt`,s.join('\n')+'\n');await browser?.close().catch(()=>{})});
+          NODE
+          node --check diagnostico-v19.cjs
+      - name: Ejecutar prueba del motor
+        shell: bash
+        run: |
+          set +e
+          if [ "$ENGINE" = 'mesa-zink' ]; then
+            export GALLIUM_DRIVER=zink
+            export MESA_LOADER_DRIVER_OVERRIDE=zink
+          fi
+          if [ "$ENGINE" = 'angle-vulkan' ] || [ "$ENGINE" = 'mesa-zink' ]; then
+            ICD=$(find /usr/share/vulkan/icd.d -iname '*lvp*json' | head -1)
+            if [ -n "$ICD" ]; then export VK_ICD_FILENAMES="$ICD"; fi
+          fi
+          case "$ENGINE" in
+            mesa-llvmpipe|mesa-egl|angle-opengl|mesa-zink|xvfb-gui)
+              xvfb-run -a -s '-screen 0 1280x900x24 +extension GLX +render -noreset' node diagnostico-v19.cjs
+              ;;
+            *) node diagnostico-v19.cjs ;;
+          esac
+          echo "Código de salida del diagnóstico: $?"
+          exit 0
+      - name: Guardar resultados incluso si la prueba falla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v19-cults3d-${{ matrix.engine }}
+          path: resultado/
+          if-no-files-found: warn
+          retention-days: 14
