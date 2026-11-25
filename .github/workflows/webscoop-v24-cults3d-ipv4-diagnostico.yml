@@ -1,0 +1,143 @@
+name: WebScoop V24 - Cults3D IPv4 diagnostico
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dns:
+    name: V24 - DNS y rutas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Diagnostico DNS
+        shell: bash
+        run: |
+          mkdir -p reports
+          {
+            echo "=== DNS y red ==="
+            date -u
+            ip -brief address
+            ip route
+            for host in cults3d.com www.cults3d.com challenges.cloudflare.com brunhild.challenges.cloudflare.com; do
+              echo "===== $host ====="
+              getent ahostsv4 "$host" || true
+              getent ahostsv6 "$host" || true
+              dig +short A "$host" @1.1.1.1 || true
+              dig +short AAAA "$host" @1.1.1.1 || true
+              dig +short A "$host" @8.8.8.8 || true
+              dig +short AAAA "$host" @8.8.8.8 || true
+            done
+          } > reports/dns.txt 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: webscoop-v24-dns
+          path: reports/
+          if-no-files-found: warn
+
+  ipv4:
+    name: V24 - IPv4 por IP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Comparar IPv4 con SNI correcto
+        shell: bash
+        run: |
+          mkdir -p reports/headers
+          {
+            echo "=== Respuestas HTTPS por IPv4 ==="
+            date -u
+            for target in "auto" "172.67.75.246" "104.26.12.215" "104.26.13.215"; do
+              echo "===== destino: $target ====="
+              for path in /es /es/modelo-3d/artilugios/support-smartphonr-edition-nature; do
+                echo "--- $path ---"
+                args=()
+                if [ "$target" != "auto" ]; then
+                  args=(--resolve "cults3d.com:443:$target")
+                fi
+                safe=$(echo "${target}_${path}" | tr '/:.' '___')
+                curl -4 -sS -L --max-time 25 --connect-timeout 10 \
+                  "${args[@]}" -o /dev/null -D "reports/headers/${safe}.txt" \
+                  -w 'http_code=%{http_code} remote_ip=%{remote_ip} ssl_verify=%{ssl_verify_result} redirects=%{num_redirects} total=%{time_total}\n' \
+                  "https://cults3d.com${path}" || true
+                grep -iE '^(HTTP/|server:|cf-ray:|cf-mitigated:|location:|content-type:)' "reports/headers/${safe}.txt" || true
+              done
+            done
+          } > reports/ipv4-comparativa.txt 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: webscoop-v24-ipv4
+          path: reports/
+          if-no-files-found: warn
+
+  navegador:
+    name: V24 - Navegacion normal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Instalar Playwright y Chromium
+        shell: bash
+        run: |
+          npm install --no-save playwright@1.58.2
+          npx playwright install --with-deps chromium
+      - name: Navegacion sin modificar verificaciones
+        shell: bash
+        run: |
+          mkdir -p reports
+          cat > v24-browser.cjs <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const url = 'https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature';
+          (async () => {
+            const events = [];
+            const log = (type, data) => events.push({ at: new Date().toISOString(), type, ...data });
+            let browser;
+            try {
+              browser = await chromium.launch({ headless: true });
+              const context = await browser.newContext({ locale: 'es-ES', viewport: { width: 1280, height: 900 } });
+              const page = await context.newPage();
+              page.on('requestfailed', r => log('requestfailed', { url: r.url().split('?')[0], error: r.failure()?.errorText }));
+              page.on('response', r => {
+                const u = r.url();
+                if (/cults3d\.com|cloudflare\.com/i.test(u)) {
+                  log('response', { url: u.split('?')[0], status: r.status(), resourceType: r.request().resourceType() });
+                }
+              });
+              const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(e => {
+                log('navigation_error', { message: e.message }); return null;
+              });
+              log('initial', { status: response?.status() ?? null, title: await page.title().catch(() => '') });
+              for (const seconds of [0, 8, 20]) {
+                if (seconds) await page.waitForTimeout(seconds === 8 ? 8000 : 12000);
+                const state = await page.evaluate(() => ({
+                  title: document.title,
+                  text: (document.body?.innerText || '').slice(0, 600),
+                  scripts: [...document.scripts].map(s => { try { return new URL(s.src).hostname; } catch { return ''; } }).filter(Boolean).slice(0, 30)
+                })).catch(e => ({ error: e.message }));
+                log('snapshot', { seconds, url: page.url().split('?')[0], state });
+                await page.screenshot({ path: `reports/cults3d-${seconds}s.png`, fullPage: false }).catch(() => {});
+              }
+              await context.close();
+            } catch (e) {
+              log('fatal', { message: e.message });
+            } finally {
+              if (browser) await browser.close().catch(() => {});
+              fs.writeFileSync('reports/browser-events.json', JSON.stringify(events, null, 2));
+              console.log(events.map(e => `${e.type}: ${JSON.stringify(e).slice(0, 400)}`).join('\n'));
+            }
+          })();
+          JS
+          node v24-browser.cjs > reports/browser-console.txt 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: webscoop-v24-navegador
+          path: reports/
+          if-no-files-found: warn
