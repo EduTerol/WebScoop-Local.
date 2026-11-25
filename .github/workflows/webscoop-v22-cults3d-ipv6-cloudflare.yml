@@ -1,0 +1,203 @@
+name: WebScoop V22 - Cults3D IPv6 y Cloudflare
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostico:
+    name: V22 - ${{ matrix.prueba }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        prueba: [dns, rutas-ipv6, http, navegador]
+    env:
+      TARGET_URL: https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature
+      TARGET_HOST: cults3d.com
+      CF_HOST: challenges.cloudflare.com
+      CF_SUBHOST: brunhild.challenges.cloudflare.com
+      RESULT_DIR: resultados
+
+    steps:
+      - name: Preparar diagnostico aislado
+        shell: bash
+        run: |
+          mkdir -p "$RESULT_DIR"
+          {
+            echo "Prueba=${{ matrix.prueba }}"
+            echo "Runner=$RUNNER_OS / $RUNNER_ARCH"
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            uname -a
+          } > "$RESULT_DIR/entorno.txt"
+          python3 --version >> "$RESULT_DIR/entorno.txt" 2>&1 || true
+          curl --version | head -n 2 >> "$RESULT_DIR/entorno.txt" 2>&1 || true
+
+      - name: DNS - resolucion y resolutores
+        if: matrix.prueba == 'dns'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dnsutils > "$RESULT_DIR/instalacion.txt" 2>&1
+          {
+            echo '=== resolv.conf ==='
+            cat /etc/resolv.conf
+            echo '=== DNS systemd ==='
+            resolvectl status 2>&1 || true
+            for host in "$TARGET_HOST" "$CF_HOST" "$CF_SUBHOST"; do
+              echo "=== $host / getent ==="
+              getent ahosts "$host" || true
+              for resolver in system 1.1.1.1 8.8.8.8; do
+                for rr in A AAAA CNAME; do
+                  echo "=== $host $rr / $resolver ==="
+                  if [ "$resolver" = system ]; then
+                    timeout 9 dig +time=2 +tries=1 +noall +answer "$host" "$rr" 2>&1 || true
+                  else
+                    timeout 9 dig +time=2 +tries=1 +noall +answer @"$resolver" "$host" "$rr" 2>&1 || true
+                  fi
+                done
+              done
+            done
+          } > "$RESULT_DIR/dns.txt" 2>&1
+
+      - name: Conectividad - IPv4 e IPv6
+        if: matrix.prueba == 'rutas-ipv6'
+        shell: bash
+        run: |
+          {
+            echo '=== direcciones ==='
+            ip -br address || true
+            echo '=== rutas IPv4 ==='
+            ip -4 route show || true
+            echo '=== rutas IPv6 ==='
+            ip -6 route show || true
+            echo '=== sysctl IPv6 ==='
+            sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 || true
+            for host in "$TARGET_HOST" "$CF_HOST" "$CF_SUBHOST"; do
+              for family in 4 6; do
+                echo "=== conexion ${host} IPv${family} ==="
+                curl -"$family" -I -sS -v --connect-timeout 8 --max-time 15 "https://$host/" -o /dev/null -w 'http_code=%{http_code} remote_ip=%{remote_ip} ssl_verify=%{ssl_verify_result} err=%{errormsg} total=%{time_total}\n' 2>&1 || true
+              done
+            done
+          } > "$RESULT_DIR/conectividad.txt" 2>&1
+
+      - name: HTTP - pagina y cabeceras de challenge
+        if: matrix.prueba == 'http'
+        shell: bash
+        run: |
+          cat > /tmp/v22_http.py <<'PYHTTP'
+          import json, os, subprocess, time, datetime
+          from pathlib import Path
+          base=Path(os.environ['RESULT_DIR'])
+          urls=[os.environ['TARGET_URL'],'https://cults3d.com/','https://challenges.cloudflare.com/','https://brunhild.challenges.cloudflare.com/']
+          out=[]
+          for url in urls:
+              for family in ('-4','-6'):
+                  ts=datetime.datetime.now(datetime.timezone.utc).isoformat()
+                  # No body, no cookies, no challenge injection and no bypass.
+                  cmd=['curl',family,'-I','-sS','-L','--max-redirs','3','--connect-timeout','8','--max-time','18',
+                       '-D','-','-o','/dev/null','-w','\nFINAL http=%{http_code} ip=%{remote_ip} redirects=%{num_redirects} verify=%{ssl_verify_result} error=%{errormsg}\n',url]
+                  try:
+                      r=subprocess.run(cmd,capture_output=True,text=True,timeout=22)
+                      # Remove cookie-related material from logs even if returned in headers.
+                      lines=[x for x in r.stdout.splitlines() if not x.lower().startswith(('set-cookie:','cookie:','authorization:'))]
+                      item={'url':url,'family':family,'timestamp':ts,'returncode':r.returncode,'headers_and_summary':'\n'.join(lines)[-18000:],'stderr':r.stderr[-3000:]}
+                  except Exception as e:
+                      item={'url':url,'family':family,'timestamp':ts,'error':str(e)}
+                  out.append(item)
+          (base/'http.json').write_text(json.dumps(out,indent=2,ensure_ascii=False))
+          PYHTTP
+          python3 /tmp/v22_http.py
+
+      - name: Navegador - instalar Playwright
+        if: matrix.prueba == 'navegador'
+        shell: bash
+        run: |
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.58.2 > "$RESULT_DIR/npm-install.txt" 2>&1
+          npx playwright install --with-deps chromium > "$RESULT_DIR/chromium-install.txt" 2>&1
+
+      - name: Navegador - cronologia de la verificacion
+        if: matrix.prueba == 'navegador'
+        shell: bash
+        run: |
+          cat > v22_browser.cjs <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+          const out = process.env.RESULT_DIR || 'resultados';
+          const url = process.env.TARGET_URL;
+          const events = [];
+          const t0 = Date.now();
+          const push = (type, data={}) => {
+            events.push({ms:Date.now()-t0,type,...data});
+          };
+          (async () => {
+            let browser;
+            try {
+              browser=await chromium.launch({headless:true,args:['--no-sandbox']});
+              const context=await browser.newContext({viewport:{width:1366,height:850}});
+              const page=await context.newPage();
+              page.on('request', req => {
+                const u=req.url();
+                if (/cults3d|cloudflare|turnstile|challenge|brunhild/i.test(u)) push('request',{url:u,method:req.method(),resource:req.resourceType()});
+              });
+              page.on('response', res => {
+                const u=res.url();
+                if (/cults3d|cloudflare|turnstile|challenge|brunhild/i.test(u)) {
+                  const h=res.headers();
+                  push('response',{url:u,status:res.status(),headers:{server:h.server||'', 'cf-mitigated':h['cf-mitigated']||'', 'content-type':h['content-type']||'', location:h.location||''}});
+                }
+              });
+              page.on('requestfailed', req => push('requestfailed',{url:req.url(),failure:req.failure()}));
+              page.on('pageerror', err => push('pageerror',{message:String(err).slice(0,800)}));
+              const res=await page.goto(url,{waitUntil:'domcontentloaded',timeout:40000}).catch(err => {push('navigation-error',{message:String(err)});return null;});
+              push('navigation',{status:res?.status()??null,url:page.url()});
+              for (const sec of [0,8,20,35]) {
+                const elapsed=Date.now()-t0;
+                const goal=sec*1000;
+                if (goal>elapsed) await page.waitForTimeout(goal-elapsed);
+                const state=await page.evaluate(() => ({title:document.title,bodyText:(document.body?.innerText||'').slice(0,900),frames:document.querySelectorAll('iframe').length})).catch(err=>({error:String(err)}));
+                push('snapshot',{second:sec,pageUrl:page.url(),...state});
+                await page.screenshot({path:path.join(out,`captura-${sec}s.png`),fullPage:false}).catch(()=>{});
+              }
+              const cfCookies=(await context.cookies()).filter(c => /^(cf_clearance|__cf_bm)$/i.test(c.name)).map(c=>({name:c.name,domain:c.domain,present:true}));
+              push('cookie-presence',{cookies:cfCookies}); // Never save cookie values.
+              await context.close();
+            } catch(err) {
+              push('fatal',{message:String(err),stack:(err.stack||'').slice(0,1800)});
+            } finally {
+              if(browser) await browser.close().catch(()=>{});
+              fs.writeFileSync(path.join(out,'cronologia.json'),JSON.stringify(events,null,2));
+              fs.writeFileSync(path.join(out,'resumen.txt'),`Total eventos: ${events.length}\nErrores: ${events.filter(e=>/error|failed|fatal/.test(e.type)).length}\n`);
+            }
+          })();
+          JS
+          node --check v22_browser.cjs
+          node v22_browser.cjs
+
+      - name: Generar resumen
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# WebScoop V22 - ${{ matrix.prueba }}"
+            echo "Fecha UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Trabajo: $GITHUB_JOB"
+            echo 'Pruebas exclusivamente diagnosticas; no eluden verificaciones Cloudflare.'
+            echo ''
+            find "$RESULT_DIR" -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
+          } > "$RESULT_DIR/LEEME.txt"
+
+      - name: Subir artefacto aunque falle una prueba
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v22-cults3d-${{ matrix.prueba }}
+          path: resultados/
+          if-no-files-found: warn
+          retention-days: 14
