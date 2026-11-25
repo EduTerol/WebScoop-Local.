@@ -1,0 +1,61 @@
+name: WebScoop V26 - Cults3D 60 segundos
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostico:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Instalar Playwright
+        run: |
+          npm install --no-save playwright@1.58.2
+          npx playwright install --with-deps chromium
+      - name: Navegar normalmente durante 60 segundos
+        shell: bash
+        run: |
+          mkdir -p reports
+          cat > test.cjs <<'JS'
+          const {chromium}=require('playwright');
+          const fs=require('fs');
+          const url='https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature';
+          const events=[];const start=Date.now();
+          const log=(kind,data={})=>events.push({seconds:Math.round((Date.now()-start)/1000),kind,...data});
+          const clean=u=>{try{const x=new URL(u);return x.origin+x.pathname}catch{return String(u)}};
+          (async()=>{
+            let browser;
+            try{
+              browser=await chromium.launch({headless:true});
+              const context=await browser.newContext({locale:'es-ES',viewport:{width:1280,height:900}});
+              const page=await context.newPage();
+              page.on('requestfailed',r=>log('failed',{url:clean(r.url()),error:r.failure()?.errorText}));
+              page.on('response',r=>{
+                if(/cults3d\.com|cloudflare\.com|\.(glb|gltf|binz|stl|obj|3mf)/i.test(r.url()))
+                  log('response',{url:clean(r.url()),status:r.status(),type:r.request().resourceType()});
+              });
+              const res=await page.goto(url,{waitUntil:'domcontentloaded',timeout:45000}).catch(e=>{log('navigation_error',{message:e.message});return null});
+              log('initial',{status:res?.status()??null});
+              const times=[0,5,10,20,35,50,60];
+              for(let i=0;i<times.length;i++){
+                if(i)await page.waitForTimeout((times[i]-times[i-1])*1000);
+                const state=await page.evaluate(()=>({title:document.title,text:(document.body?.innerText||'').slice(0,1000),canvas:document.querySelectorAll('canvas').length,iframes:document.querySelectorAll('iframe').length,modelViewer:document.querySelectorAll('model-viewer').length})).catch(e=>({error:e.message}));
+                log('snapshot',{at:times[i],url:clean(page.url()),state});
+                await page.screenshot({path:`reports/estado-${times[i]}s.png`}).catch(()=>{});
+              }
+              await context.close();
+            }catch(e){log('fatal',{message:e.message})}
+            finally{if(browser)await browser.close().catch(()=>{});fs.writeFileSync('reports/eventos.json',JSON.stringify(events,null,2));console.log('Eventos:',events.length)}
+          })();
+          JS
+          node test.cjs
+      - name: Subir resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v26-cults3d-60s
+          path: reports/
+          if-no-files-found: warn
