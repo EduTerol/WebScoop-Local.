@@ -1,0 +1,68 @@
+name: WebScoop V27 - Fuentes publicas Cults3D
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Ficha publica de Cults3D (HTTPS)'
+        required: true
+        default: 'https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature'
+        type: string
+      modo:
+        description: 'online = consultar web; archivo = procesar ZIP de capturas subido al repo; ambos = ambos'
+        required: true
+        default: 'online'
+        type: choice
+        options:
+          - online
+          - archivo
+          - ambos
+
+permissions:
+  contents: read
+
+jobs:
+  extraer-fuentes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Extraer codigo publico HTML JS CSS y JSON
+        shell: bash
+        env:
+          TARGET_URL: ${{ inputs.url }}
+          MODE: ${{ inputs.modo }}
+        run: |
+          set -euo pipefail
+          mkdir -p resultado-v27
+          ARGS=(--output resultado-v27)
+          if [[ "$MODE" == "online" || "$MODE" == "ambos" ]]; then
+            ARGS+=(--url "$TARGET_URL")
+          fi
+          if [[ "$MODE" == "archivo" || "$MODE" == "ambos" ]]; then
+            FILE="inputs/cults3d/captura.zip"
+            if [[ ! -f "$FILE" ]]; then
+              echo "Falta $FILE. Sube el ZIP de captura al repositorio o usa modo online." >&2
+              exit 1
+            fi
+            ARGS+=(--archive "$FILE")
+          fi
+          python herramientas/v27/extract_sources.py "${ARGS[@]}"
+          echo "## WebScoop V27" >> "$GITHUB_STEP_SUMMARY"
+          cat resultado-v27/INFORME_V27.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar archivos para descarga y analisis en ChatGPT
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scalper3D-V27-Codigo-Fuente-Cults3D
+          path: resultado-v27/
+          if-no-files-found: warn
+          retention-days: 7
