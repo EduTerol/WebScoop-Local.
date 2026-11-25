@@ -8,14 +8,6 @@ on:
         type: string
         required: true
         default: 'https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature'
-      ip_tailscale_movil:
-        description: 'IP Tailscale del movil configurado como nodo de salida (100.x.y.z)'
-        type: string
-        required: true
-      ip_publica_movil:
-        description: 'IP publica IPv4 que muestra api.ipify.org en el movil (para verificar la salida)'
-        type: string
-        required: true
       espera_segundos:
         description: 'Segundos para dejar cargar la pagina (10 a 60)'
         type: choice
@@ -39,8 +31,9 @@ jobs:
     env:
       TARGET_URL: ${{ inputs.url }}
       WAIT_SECONDS: ${{ inputs.espera_segundos }}
-      TAILSCALE_EXIT_NODE: ${{ inputs.ip_tailscale_movil }}
-      EXPECTED_PUBLIC_IP: ${{ inputs.ip_publica_movil }}
+      # Configurado para el movil del usuario (sin introducir IPs en Run workflow)
+      TAILSCALE_EXIT_NODE: '100.117.20.6'
+      EXPECTED_PUBLIC_IP: '148.3.58.214'
     steps:
       - name: Crear carpeta de resultados
         shell: bash
@@ -80,11 +73,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! "$TAILSCALE_EXIT_NODE" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo 'Error: indica una IP Tailscale 100.x.y.z en Run workflow' | tee resultados/VERIFICACION_RED.txt
+            echo 'Error: IP Tailscale configurada no valida' | tee resultados/VERIFICACION_RED.txt
             exit 1
           fi
           if [[ ! "$EXPECTED_PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-            echo 'Error: indica la IPv4 publica de tu movil en Run workflow' | tee resultados/VERIFICACION_RED.txt
+            echo 'Error: IP publica configurada no valida' | tee resultados/VERIFICACION_RED.txt
             exit 1
           fi
           sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" --accept-dns=false
