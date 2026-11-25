@@ -1,0 +1,232 @@
+name: WebScoop V28 - Edge real en GitHub (Cults3D)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL publica que se abrira en Edge'
+        type: string
+        required: true
+        default: 'https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature'
+      espera_segundos:
+        description: 'Segundos para dejar cargar la pagina (10 a 60)'
+        type: choice
+        required: true
+        default: '30'
+        options:
+          - '10'
+          - '20'
+          - '30'
+          - '45'
+          - '60'
+
+permissions:
+  contents: read
+
+jobs:
+  edge-real:
+    name: Microsoft Edge con pantalla virtual
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      TARGET_URL: ${{ inputs.url }}
+      WAIT_SECONDS: ${{ inputs.espera_segundos }}
+    steps:
+      - name: Crear carpeta de resultados
+        shell: bash
+        run: mkdir -p resultados
+
+      - name: Instalar Microsoft Edge estable desde repositorio oficial
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates curl gnupg xvfb xauth fonts-liberation >/dev/null
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/microsoft-edge.gpg >/dev/null
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft-edge.gpg] https://packages.microsoft.com/repos/edge stable main' | sudo tee /etc/apt/sources.list.d/microsoft-edge.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq microsoft-edge-stable >/dev/null
+          echo '=== Edge instalado ===' | tee resultados/INSTALACION.txt
+          microsoft-edge --version | tee -a resultados/INSTALACION.txt
+          echo '=== Sistema ===' | tee -a resultados/INSTALACION.txt
+          uname -a | tee -a resultados/INSTALACION.txt
+
+      - name: Instalar monitor Playwright para controlar Edge
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version | tee resultados/NODE.txt
+          npm install --no-save --no-audit --no-fund playwright-core@1.58.2 >/dev/null
+
+      - name: Crear monitor HTTP y extractor de fuentes publicas
+        shell: bash
+        run: |
+          cat > prueba-edge-v28.cjs <<'NODE'
+          'use strict';
+          const {chromium}=require('playwright-core');
+          const fs=require('node:fs');
+          const path=require('node:path');
+          const crypto=require('node:crypto');
+          const OUT='resultados';
+          const TARGET=process.env.TARGET_URL || 'https://cults3d.com/';
+          const WAIT=Math.max(10,Math.min(60,Number(process.env.WAIT_SECONDS)||30));
+          const LIMIT_FILES=160, MAX_FILE=5*1024*1024, MAX_TOTAL=45*1024*1024;
+          fs.mkdirSync(path.join(OUT,'fuentes'),{recursive:true});
+
+          // Evita publicar query strings, firmas CDN, cookies y tokens en el artefacto.
+          function safeURL(s) {
+            try {const u=new URL(s); return (u.origin+u.pathname).slice(0,600);}
+            catch{return '(URL no disponible)';}
+          }
+          function removeSecrets(s) {
+            return String(s)
+              .replace(/([?&](?:Signature|Expires|Key-Pair-Id|token|access_token|authenticity_token|key|session|code|secret|jwt)=)[^\s"'<>;&]+/gi,'$1[OCULTO]')
+              .replace(/(<meta\b[^>]*name=["']csrf-token["'][^>]*content=["'])[^"']+/gi,'$1[OCULTO]')
+              .replace(/(<input\b[^>]*name=["']authenticity_token["'][^>]*value=["'])[^"']+/gi,'$1[OCULTO]');
+          }
+          function localSite(s) {
+            try {const h=new URL(s).hostname.toLowerCase(); return h==='cults3d.com'||h.endsWith('.cults3d.com');}
+            catch{return false;}
+          }
+          function kind(url,type){
+            const p=(()=>{try{return new URL(url).pathname.toLowerCase();}catch{return '';}})();
+            const t=(type||'').toLowerCase();
+            if(/\.js$|\.mjs$/.test(p)||/javascript|ecmascript/.test(t))return 'js';
+            if(/\.css$/.test(p)||t.includes('text/css'))return 'css';
+            if(/\.json$/.test(p)||t.includes('application/json'))return 'json';
+            if(/\.html?$/.test(p)||t.includes('text/html'))return 'html';
+            return null;
+          }
+          const report={version:'V28',browser:'Microsoft Edge Stable',mode:'GUI con Xvfb',
+            target:safeURL(TARGET),start:new Date().toISOString(),waitSeconds:WAIT,
+            navigation:{},responses:[],failures:[],errors:[],sourceFiles:[],
+            document:{},challengeSignals:[],status:'pending'};
+          let browser, pending=[],total=0,seen=new Set();
+          function small(list,item,limit){if(list.length<limit)list.push(item);}
+          async function observe(response) {
+            const headers=response.headers();
+            const type=(headers['content-type']||'').split(';')[0];
+            const entry={url:safeURL(response.url()),status:response.status(),contentType:type,
+              method:response.request().method(),resourceType:response.request().resourceType(),
+              location:headers.location?safeURL(new URL(headers.location,response.url()).href):undefined};
+            small(report.responses,entry,600);
+            const k=kind(response.url(),type);
+            if(!k||!localSite(response.url())||!['GET','HEAD'].includes(entry.method))return;
+            if(response.url().includes('/cdn-cgi/challenge-platform/'))return;
+            if(response.status()<200||response.status()>=400)return;
+            if(report.sourceFiles.length>=LIMIT_FILES||total>=MAX_TOTAL)return;
+            const stated=Number(headers['content-length']||0);
+            if(stated>MAX_FILE)return;
+            try {
+              const bytes=await response.body();
+              if(!bytes.length||bytes.length>MAX_FILE||total+bytes.length>MAX_TOTAL)return;
+              const sha=crypto.createHash('sha256').update(bytes).digest('hex');
+              if(seen.has(sha))return;
+              seen.add(sha);
+              const name=String(report.sourceFiles.length+1).padStart(4,'0')+'_'+sha.slice(0,14)+'.'+k;
+              fs.writeFileSync(path.join(OUT,'fuentes',name),removeSecrets(bytes.toString('utf8')),'utf8');
+              total+=bytes.length;
+              report.sourceFiles.push({file:'fuentes/'+name,url:safeURL(response.url()),type:k,bytes:bytes.length,sha256:sha});
+            }catch(e){small(report.errors,'Lectura de recurso: '+String(e).slice(0,200),40);}
+          }
+          async function inspect(page,label){
+            try {
+              const info=await page.evaluate(()=>({title:document.title,
+                htmlLength:document.documentElement?.outerHTML?.length||0,
+                text:(document.body?.innerText||'').slice(0,1800),
+                scripts:[...document.querySelectorAll('script[src]')].map(x=>x.src).slice(0,150),
+                forms:[...document.querySelectorAll('form[action]')].map(x=>({method:x.method,action:x.action})).slice(0,70),
+                links:[...document.querySelectorAll('a[href]')].map(x=>x.href).filter(x=>/download|descarga|free_order|\.stl|\.zip|\.3mf/i.test(x)).slice(0,75)}));
+              report.document={title:info.title,htmlLength:info.htmlLength,
+                textSample:removeSecrets(info.text),scripts:info.scripts.map(safeURL),
+                forms:info.forms.map(x=>({method:x.method,action:safeURL(x.action)})),
+                downloadRelatedLinks:info.links.map(safeURL)};
+              const combined=(info.title+' '+info.text).toLowerCase();
+              for(const term of ['just a moment','checking your browser','verify you are human',
+                  'cloudflare','access denied','error 403','comprueba que eres humano']){
+                if(combined.includes(term)&&!report.challengeSignals.includes(term))report.challengeSignals.push(term);
+              }
+              fs.writeFileSync(path.join(OUT,`pagina-${label}.html`),removeSecrets(await page.content()),'utf8');
+              await page.screenshot({path:path.join(OUT,`pantalla-${label}.png`),fullPage:false,timeout:15000});
+            }catch(e){small(report.errors,`Inspeccion ${label}: ${String(e).slice(0,400)}`,50);}
+          }
+          async function main(){
+            const u=new URL(TARGET);
+            if(u.protocol!=='https:'||!(u.hostname==='cults3d.com'||u.hostname.endsWith('.cults3d.com'))){
+              throw new Error('Solo se aceptan URL HTTPS de Cults3D');
+            }
+            report.status='starting_browser';
+            browser=await chromium.launch({channel:'msedge',headless:false,
+              args:['--no-sandbox','--disable-dev-shm-usage','--window-size=1365,900'],timeout:55000});
+            report.edgeVersion=browser.version();
+            const context=await browser.newContext({locale:'es-ES',viewport:{width:1365,height:900},
+              acceptDownloads:false});
+            const page=await context.newPage();
+            page.on('response',r=>{pending.push(observe(r));});
+            page.on('requestfailed',r=>small(report.failures,{url:safeURL(r.url()),
+              reason:r.failure()?.errorText||'desconocido'},120));
+            page.on('pageerror',e=>small(report.errors,'JS: '+String(e).slice(0,400),100));
+            report.status='navigating';
+            try {
+              const r=await page.goto(TARGET,{waitUntil:'domcontentloaded',timeout:55000});
+              report.navigation={httpStatus:r?.status()||null,url:safeURL(page.url()),redirected:!!r&&safeURL(r.url())!==safeURL(TARGET)};
+            }catch(e){report.navigation={error:String(e).slice(0,600),url:safeURL(page.url())};}
+            await page.waitForTimeout(4500);
+            await inspect(page,'inicial');
+            await page.waitForTimeout(WAIT*1000);
+            await inspect(page,'final');
+            await Promise.allSettled(pending);
+            report.navigation.finalUrl=safeURL(page.url());
+            report.status='finished';
+          }
+          (async()=>{
+            try{await main();}catch(e){report.status='error';report.fatal=String(e).slice(0,1200);}
+            finally{
+              report.end=new Date().toISOString();
+              fs.writeFileSync(path.join(OUT,'INFORME_V28.json'),JSON.stringify(report,null,2));
+              const r=[
+                '# WebScoop V28 - Microsoft Edge en GitHub',
+                '',`- **Edge**: ${report.edgeVersion||'No iniciado'}`,
+                `- **URL**: ${report.target}`,
+                `- **HTTP inicial**: ${report.navigation.httpStatus??'No disponible'}`,
+                `- **URL final**: ${report.navigation.finalUrl||report.navigation.url||'No disponible'}`,
+                `- **Titulo**: ${report.document.title||'No disponible'}`,
+                `- **HTML visible (caracteres)**: ${report.document.htmlLength??0}`,
+                `- **Respuestas HTTP registradas**: ${report.responses.length}`,
+                `- **Ficheros JS/HTML/CSS/JSON guardados**: ${report.sourceFiles.length}`,
+                `- **Bytes fuente**: ${total}`,
+                `- **Senales de desafio**: ${report.challengeSignals.join(', ')||'ninguna observada'}`,
+                `- **Errores de red**: ${report.failures.length}`,
+                `- **Estado**: ${report.status}`,
+                `- **Error principal**: ${report.fatal||report.navigation.error||'ninguno'}`,
+                '',
+                'La prueba no inicia descargas ni intenta resolver verificaciones de Cloudflare.',
+                'Las URL se guardan sin parametros y no se exportan cookies ni perfiles del navegador.'
+              ];
+              fs.writeFileSync(path.join(OUT,'RESUMEN_V28.md'),r.join('\n')+'\n');
+              try{await browser?.close();}catch{}
+            }
+          })();
+          NODE
+          node --check prueba-edge-v28.cjs
+
+      - name: Ejecutar Edge con pantalla virtual (sin sesion ni tokens)
+        shell: bash
+        run: |
+          set +e
+          xvfb-run -a -s '-screen 0 1365x900x24 -ac' node prueba-edge-v28.cjs 2>&1 | tee resultados/CONSOLA_V28.txt
+          echo "Salida del monitor: ${PIPESTATUS[0]}" | tee -a resultados/CONSOLA_V28.txt
+          if [[ -f resultados/RESUMEN_V28.md ]]; then
+            cat resultados/RESUMEN_V28.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: Adjuntar informes y fuentes para descargar desde el movil
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scalper3D-V28-Edge-GitHub-Resultados
+          path: resultados/
+          if-no-files-found: warn
+          retention-days: 7
