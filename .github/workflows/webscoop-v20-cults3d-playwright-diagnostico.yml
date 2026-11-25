@@ -1,0 +1,165 @@
+name: WebScoop V20 - Cults3D Playwright diagnostico
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostico:
+    name: Playwright ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [gui-xvfb, headless]
+    env:
+      TEST_MODE: ${{ matrix.mode }}
+      TARGET_URL: https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      GALLIUM_DRIVER: llvmpipe
+    steps:
+      - name: Preparar navegador y herramientas
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium xvfb xauth mesa-utils mesa-vulkan-drivers vulkan-tools dnsutils curl ca-certificates >/dev/null
+          npm install --no-save --no-audit --no-fund playwright-core@1.58.2 >/dev/null
+          mkdir -p resultados
+          node --version
+          chromium --version
+      - name: Diagnosticar conectividad sin autenticacion
+        shell: bash
+        run: |
+          set +e
+          {
+            echo 'WebScoop V20: diagnóstico de DNS y HTTP (sin cookies ni claves)'
+            echo '== DNS Cults3D =='
+            dig +short cults3d.com A
+            dig +short cults3d.com AAAA
+            echo '== DNS Cloudflare challenge =='
+            dig +short challenges.cloudflare.com A
+            echo '== Cabeceras iniciales de Cults3D =='
+            curl --silent --show-error --location --max-time 30 --output /dev/null \
+              --write-out 'HTTP=%{http_code}\nIP=%{remote_ip}\nRedirects=%{num_redirects}\nTLS=%{ssl_verify_result}\nURL_final=%{url_effective}\n' \
+              "$TARGET_URL"
+          } > resultados/conectividad.txt 2>&1
+          true
+      - name: Crear analizador Playwright
+        shell: bash
+        run: |
+          cat > prueba-v20.cjs <<'NODE'
+          'use strict';
+          const { chromium } = require('playwright-core');
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const path = require('node:path');
+          const MODE = process.env.TEST_MODE;
+          const URL = process.env.TARGET_URL;
+          const DIR = 'resultados';
+          fs.mkdirSync(DIR, { recursive: true });
+          const result = {
+            version:'V20',mode:MODE, target:URL,started:new Date().toISOString(),
+            environment:{chromium:'/usr/bin/chromium',headless:MODE==='headless',display:!!process.env.DISPLAY},
+            navigation:{},stages:[],responses:[],failures:[],consoleErrors:[],pageErrors:[],
+            challengeMarkers:[],resourceCandidates:[],webgl:null,frames:[],status:'not_started'
+          };
+          const keep = (list, value, limit=250) => { if(list.length<limit) list.push(value); };
+          const safeUrl = (input) => {
+            try { const u=new URL(input); return u.origin+u.pathname; } catch { return String(input).slice(0,300); }
+          };
+          async function inspect(page,label) {
+            const info = await page.evaluate(() => {
+              const body=(document.body?.innerText||'').slice(0,3500);
+              const clean=(v)=> String(v||'').slice(0,350);
+              const glcheck=(type)=>{
+                try {
+                  const gl=document.createElement('canvas').getContext(type);
+                  if(!gl) return {available:false};
+                  const ext=gl.getExtension('WEBGL_debug_renderer_info');
+                  return {available:true,version:clean(gl.getParameter(gl.VERSION)),renderer:clean(ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER))};
+                } catch(e) { return {error:String(e).slice(0,200)}; }
+              };
+              return {
+                title:clean(document.title),url:location.origin+location.pathname,
+                text:body,htmlLength:document.documentElement?.outerHTML.length||0,
+                iframes:[...document.querySelectorAll('iframe')].map(f=>clean(f.src)).slice(0,20),
+                linksTo3D:[...document.querySelectorAll('a[href]')].map(a=>a.href).filter(h=>/\.(stl|3mf|obj|glb|gltf|zip)(\?|#|$)/i.test(h)).slice(0,30),
+                webgl:{webgl1:glcheck('webgl'),webgl2:glcheck('webgl2')}
+              };
+            });
+            const lower=(info.title+' '+info.text).toLowerCase();
+            const challengeTerms=['just a moment','performing security verification','verify you are human','checking your browser','turnstile','verificación de seguridad','cloudflare'];
+            const hits=challengeTerms.filter(term=>lower.includes(term));
+            result.stages.push({label, time:new Date().toISOString(),title:info.title,url:info.url,htmlLength:info.htmlLength,bodyExcerpt:info.text.slice(0,1600),iframes:info.iframes,linksTo3D:info.linksTo3D,challengeSignals:hits});
+            result.webgl=info.webgl;
+            if(hits.length) result.challengeMarkers=[...new Set([...result.challengeMarkers,...hits])];
+            try { await page.screenshot({path:path.join(DIR,`pantalla-${MODE}-${label}.png`),timeout:15000}); }
+            catch(e){ keep(result.consoleErrors,`Screenshot ${label}: ${String(e).slice(0,250)}`); }
+          }
+          let browser;
+          (async()=>{
+            result.status='launching';
+            const flags=[
+              '--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--ignore-gpu-blocklist',
+              '--use-gl=angle','--use-angle=vulkan','--enable-features=Vulkan','--window-size=1280,900'
+            ];
+            browser=await chromium.launch({executablePath:'/usr/bin/chromium',headless:MODE==='headless',args:flags,timeout:45000});
+            result.browserVersion=browser.version();
+            const context=await browser.newContext({viewport:{width:1280,height:900},locale:'es-ES'});
+            const page=await context.newPage();
+            page.on('response',r=>keep(result.responses,{url:safeUrl(r.url()),status:r.status(),type:(r.headers()['content-type']||'').slice(0,100)},450));
+            page.on('requestfailed',req=>keep(result.failures,{url:safeUrl(req.url()),reason:req.failure()?.errorText||'unknown'},100));
+            page.on('pageerror',e=>keep(result.pageErrors,String(e).slice(0,600),100));
+            page.on('console',m=>{if(m.type()==='error')keep(result.consoleErrors,m.text().slice(0,500),100);});
+            result.status='navigating';
+            try {
+              const resp=await page.goto(URL,{waitUntil:'domcontentloaded',timeout:55000});
+              result.navigation={initialStatus:resp?.status()||null,url:resp?safeUrl(resp.url()):null};
+            }catch(e){result.navigation.error=String(e).slice(0,600);}
+            await inspect(page,'inicial');
+            await page.waitForTimeout(12000);
+            await inspect(page,'12s');
+            await page.waitForTimeout(12000);
+            await inspect(page,'24s');
+            result.frames=page.frames().map(f=>safeUrl(f.url())).slice(0,30);
+            result.resourceCandidates=result.responses.filter(r=>/\.(stl|3mf|obj|glb|gltf|zip|binz|bin)(\?|#|$)|model\/gltf|application\/octet-stream/i.test(r.url+' '+r.type));
+            result.status='completed';
+          })().catch(e=>{result.fatal=String(e).slice(0,1200);result.status='error';process.exitCode=1;})
+          .finally(async()=>{
+            result.finished=new Date().toISOString();
+            fs.writeFileSync(path.join(DIR,`informe-${MODE}.json`),JSON.stringify(result,null,2));
+            const s=[`WebScoop V20 - ${MODE}`,`HTTP inicial: ${result.navigation.initialStatus??'no disponible'}`,
+              `URL: ${result.navigation.url||'no disponible'}`,`Señales de protección: ${result.challengeMarkers.join(', ')||'ninguna detectada'}`,
+              `WebGL: ${JSON.stringify(result.webgl)}`,`Respuestas: ${result.responses.length}`,
+              `Archivos 3D observados: ${result.resourceCandidates.length}`,`Errores de red: ${result.failures.length}`,
+              `Estado: ${result.status}`,`Error fatal: ${result.fatal||'ninguno'}`];
+            fs.writeFileSync(path.join(DIR,`RESUMEN-${MODE}.txt`),s.join('\n')+'\n');
+            try { await browser?.close(); }catch{}
+          });
+          NODE
+          node --check prueba-v20.cjs
+      - name: Ejecutar prueba aislada
+        shell: bash
+        run: |
+          set +e
+          ICD=$(find /usr/share/vulkan/icd.d -iname '*lvp*json' | head -1)
+          if [ -n "$ICD" ]; then export VK_ICD_FILENAMES="$ICD"; fi
+          if [ "$TEST_MODE" = 'gui-xvfb' ]; then
+            xvfb-run -a -s '-screen 0 1280x900x24 +extension GLX +render -noreset' node prueba-v20.cjs
+          else
+            node prueba-v20.cjs
+          fi
+          echo "Código de salida: $?"
+          exit 0
+      - name: Guardar resultados aunque falle la prueba
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v20-cults3d-${{ matrix.mode }}
+          path: resultados/
+          if-no-files-found: warn
+          retention-days: 7
