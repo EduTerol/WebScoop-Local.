@@ -1,0 +1,160 @@
+name: WebScoop V25 - Importador autorizado Cults3D
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  importar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Instalar conversor y visor local
+        run: |
+          pip install "trimesh[easy]==4.9.0" numpy
+          npm install --no-save three@0.181.2
+      - name: Convertir archivos y generar visor
+        shell: bash
+        run: |
+          mkdir -p output/visor/libs output/STL_piezas inputs/cults3d
+          cp node_modules/three/build/three.module.js output/visor/libs/
+          cp node_modules/three/examples/jsm/controls/OrbitControls.js output/visor/libs/
+          cp node_modules/three/examples/jsm/loaders/GLTFLoader.js output/visor/libs/
+          cp node_modules/three/examples/jsm/utils/BufferGeometryUtils.js output/visor/libs/
+          cat > convert.py <<'PY'
+          from pathlib import Path
+          import json, re, traceback
+          import numpy as np
+          import trimesh
+
+          root=Path('inputs/cults3d')
+          out=Path('output')
+          viewer=out/'visor'
+          extensions={'.stl','.obj','.glb','.gltf','.3mf','.ply','.off'}
+          candidates=sorted(p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in extensions)
+          log={'source':'Archivos aportados por el usuario; no se descarga nada de Cults3D','files':[],'errors':[]}
+          if not candidates:
+              demo=trimesh.creation.box(extents=[20,12,8])
+              demo.export(root/'DEMO_cubo.stl')
+              candidates=[root/'DEMO_cubo.stl']
+              log['demo']=True
+          else:
+              log['demo']=False
+          scene=trimesh.Scene()
+          part=0
+          combined=[]
+          for file in candidates:
+              try:
+                  loaded=trimesh.load(str(file),force='scene',process=False)
+                  count=0
+                  for index,mesh in enumerate(loaded.dump(concatenate=False)):
+                      if not isinstance(mesh,trimesh.Trimesh) or not len(mesh.faces):
+                          continue
+                      mesh=mesh.copy()
+                      if mesh.visual.kind == 'texture':
+                          pass
+                      label=f'{file.stem}_{index+1}'
+                      safe=re.sub(r'[^a-zA-Z0-9_-]+','_',label)[:90]
+                      part+=1
+                      mesh.export(out/'STL_piezas'/f'{part:04d}_{safe}.stl')
+                      scene.add_geometry(mesh,geom_name=f'{part:04d}_{safe}',node_name=f'{part:04d}_{safe}')
+                      combined.append(mesh)
+                      count+=1
+                  log['files'].append({'name':str(file),'pieces':count})
+              except Exception as exc:
+                  log['errors'].append({'file':str(file),'error':str(exc)})
+          if part:
+              (viewer/'modelo.glb').write_bytes(scene.export(file_type='glb'))
+              trimesh.util.concatenate(combined).export(out/'modelo_completo.stl')
+          log['total_pieces']=part
+          (out/'informe.json').write_text(json.dumps(log,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(log,indent=2,ensure_ascii=False))
+          PY
+          python convert.py
+          cat > output/visor/index.html <<'HTML'
+          <!doctype html>
+          <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>WebScoop V25 - Visor offline</title>
+          <style>
+          *{box-sizing:border-box}body{margin:0;background:#121820;color:#e9eef4;font:14px system-ui}
+          header{padding:12px 18px;background:#202b38}main{display:flex;height:calc(100vh - 54px)}
+          #view{flex:1;min-width:0}aside{width:280px;overflow:auto;background:#1b2530;padding:12px}
+          button{background:#32485e;border:0;color:white;padding:7px;margin:3px;border-radius:5px;cursor:pointer}
+          .item{display:flex;align-items:center;padding:6px;gap:6px;border-bottom:1px solid #334}
+          .item.selected{background:#365f78}.item span{overflow-wrap:anywhere}
+          @media(max-width:650px){main{flex-direction:column}#view{min-height:55vh}aside{width:100%;flex:1}}
+          </style></head><body><header><b>WebScoop V25</b> · visor local · clic en una pieza para seleccionarla</header>
+          <main><div id="view"></div><aside><button id="show">Mostrar todas</button><button id="hide">Ocultar seleccionada</button><div id="parts"></div></aside></main>
+          <script type="importmap">{"imports":{"three":"./libs/three.module.js","three/addons/controls/OrbitControls.js":"./libs/OrbitControls.js","three/addons/loaders/GLTFLoader.js":"./libs/GLTFLoader.js","three/addons/utils/BufferGeometryUtils.js":"./libs/BufferGeometryUtils.js"}}</script>
+          <script type="module">
+          import * as THREE from 'three';
+          import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+          import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+          const holder=document.getElementById('view'), list=document.getElementById('parts');
+          const renderer=new THREE.WebGLRenderer({antialias:true});holder.appendChild(renderer.domElement);
+          const scene=new THREE.Scene();scene.background=new THREE.Color(0x121820);
+          const camera=new THREE.PerspectiveCamera(50,1,.01,1e7);camera.position.set(60,40,60);
+          const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;
+          scene.add(new THREE.HemisphereLight(0xffffff,0x334455,2));
+          const light=new THREE.DirectionalLight(0xffffff,2);light.position.set(4,8,6);scene.add(light);
+          let meshes=[],selected=null;
+          function resize(){const w=holder.clientWidth,h=holder.clientHeight;renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix()}
+          new ResizeObserver(resize).observe(holder);
+          function select(m){selected=m;document.querySelectorAll('.item').forEach(e=>e.classList.toggle('selected',e.dataset.id===String(meshes.indexOf(m))));document.querySelector('.item.selected')?.scrollIntoView({block:'nearest'});}
+          new GLTFLoader().load('./modelo.glb',gltf=>{
+            scene.add(gltf.scene);
+            gltf.scene.traverse(obj=>{if(obj.isMesh){meshes.push(obj);const i=meshes.length-1;
+              const div=document.createElement('div');div.className='item';div.dataset.id=String(i);
+              const cb=document.createElement('input');cb.type='checkbox';cb.checked=true;cb.onchange=()=>obj.visible=cb.checked;
+              const label=document.createElement('span');label.textContent=obj.name||'Pieza '+(i+1);
+              div.append(cb,label);div.onclick=e=>{if(e.target!==cb)select(obj)};list.append(div);
+            }});
+            const box=new THREE.Box3().setFromObject(gltf.scene),size=box.getSize(new THREE.Vector3()),center=box.getCenter(new THREE.Vector3());
+            controls.target.copy(center);const d=Math.max(size.length(),1);camera.position.copy(center).add(new THREE.Vector3(d,d*.7,d));camera.near=d/10000;camera.far=d*100;camera.updateProjectionMatrix();controls.update();
+          },undefined,e=>{list.textContent='Error cargando modelo.glb: '+e.message});
+          renderer.domElement.addEventListener('click',e=>{
+            const r=renderer.domElement.getBoundingClientRect(),mouse=new THREE.Vector2((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);
+            const ray=new THREE.Raycaster();ray.setFromCamera(mouse,camera);const hit=ray.intersectObjects(meshes,false)[0];if(hit)select(hit.object);
+          });
+          document.getElementById('show').onclick=()=>{meshes.forEach(m=>m.visible=true);document.querySelectorAll('.item input').forEach(c=>c.checked=true)};
+          document.getElementById('hide').onclick=()=>{if(selected){selected.visible=false;(()=>{const c=document.querySelectorAll('.item')[meshes.indexOf(selected)]?.querySelector('input');if(c)c.checked=false})()}};
+          function tick(){requestAnimationFrame(tick);controls.update();renderer.render(scene,camera)}tick();
+          </script></body></html>
+          HTML
+          # Incrustar GLB como data URL: permite abrir index.html directamente desde file://.
+          python - <<'PYEMBED'
+          from pathlib import Path
+          import base64
+          html=Path('output/visor/index.html')
+          glb=Path('output/visor/modelo.glb')
+          if glb.exists():
+              uri='data:model/gltf-binary;base64,'+base64.b64encode(glb.read_bytes()).decode('ascii')
+              text=html.read_text()
+              text=text.replace("'./modelo.glb',gltf=>",repr(uri)+",gltf=>")
+              html.write_text(text)
+          PYEMBED
+          cat > output/LEEME.txt <<'TXT' 
+          WebScoop V25 - Importador de archivos descargados con autorizacion.
+          Coloca los STL, OBJ, GLB, GLTF, 3MF, PLY u OFF en inputs/cults3d/ y ejecuta el workflow.
+          Si no hay archivos, genera un cubo de DEMOSTRACION.
+          Los STL individuales estan en STL_piezas/ y el conjunto en modelo_completo.stl.
+          Para ver el visor offline, descomprime el ZIP y abre visor/index.html.
+          El modelo GLB se incrusta en el HTML para permitir apertura directa file://.
+          El visor no requiere Internet.
+          Las texturas externas de OBJ/GLTF deben adjuntarse junto a los archivos fuente.
+          TXT
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: webscoop-v25-importador-offline
+          path: output/
+          if-no-files-found: warn
