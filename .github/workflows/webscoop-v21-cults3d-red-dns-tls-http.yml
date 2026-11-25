@@ -1,0 +1,147 @@
+name: WebScoop V21 - Cults3D DNS TLS HTTP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostico:
+    name: "V21 / ${{ matrix.prueba }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        prueba: [dns, tls, http]
+
+    steps:
+      - name: Preparar herramientas y carpeta aislada
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dnsutils openssl curl ca-certificates python3 >/dev/null
+          mkdir -p resultados
+          {
+            echo "WebScoop V21 - Prueba: ${{ matrix.prueba }}"
+            echo "Fecha UTC: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Runner: ${RUNNER_OS:-unknown} / $(uname -a)"
+            echo "Atención: diagnóstico pasivo de conectividad, no resuelve retos Cloudflare."
+          } > resultados/README.txt
+
+      - name: DNS - comparativa de resolutores sin cambiar el DNS del runner
+        if: matrix.prueba == 'dns'
+        shell: bash
+        run: |
+          set -u
+          {
+            echo '=== Configuración DNS local ==='
+            cat /etc/resolv.conf
+            echo
+            echo '=== Resolución a través de getent ==='
+            for host in cults3d.com www.cults3d.com challenges.cloudflare.com brunhild.challenges.cloudflare.com example.com; do
+              echo "--- $host ---"
+              timeout 10 getent ahosts "$host" || true
+            done
+            echo
+            for resolver in default 1.1.1.1 8.8.8.8; do
+              echo "=== Resolver: $resolver ==="
+              for host in cults3d.com www.cults3d.com challenges.cloudflare.com brunhild.challenges.cloudflare.com example.com; do
+                echo "--- $host ---"
+                for type in A AAAA CNAME; do
+                  echo "Consulta: $type"
+                  if [ "$resolver" = default ]; then
+                    timeout 8 dig +time=2 +tries=1 "$host" "$type" +noall +comments +answer 2>&1 || true
+                  else
+                    timeout 8 dig @"$resolver" +time=2 +tries=1 "$host" "$type" +noall +comments +answer 2>&1 || true
+                  fi
+                done
+              done
+            done
+          } > resultados/dns.txt 2>&1
+          echo 'DNS finalizado; consultar resultados/dns.txt'
+
+      - name: TLS - verificar conexión, certificado y SNI
+        if: matrix.prueba == 'tls'
+        shell: bash
+        run: |
+          set -u
+          {
+            echo "CA bundle: $(openssl version -d)"
+            echo "OpenSSL: $(openssl version)"
+            for host in cults3d.com www.cults3d.com challenges.cloudflare.com brunhild.challenges.cloudflare.com example.com; do
+              echo
+              echo "========== $host ==========" 
+              echo 'Resolución:'
+              timeout 8 getent ahostsv4 "$host" || true
+              echo 'Handshake y verificación CA con SNI:'
+              timeout 15 bash -c 'echo | openssl s_client -connect "$1:443" -servername "$1" -verify_return_error -brief' _ "$host" 2>&1 | head -n 40 || true
+              echo 'Certificado público (si se presenta):'
+              timeout 15 bash -c 'echo | openssl s_client -connect "$1:443" -servername "$1" 2>/dev/null | openssl x509 -noout -subject -issuer -dates' _ "$host" 2>&1 || true
+            done
+          } > resultados/tls.txt 2>&1
+          echo 'TLS finalizado; consultar resultados/tls.txt'
+
+      - name: HTTP - comparar respuestas públicas sin guardar cookies ni desafíos
+        if: matrix.prueba == 'http'
+        shell: bash
+        run: |
+          set -u
+          URL='https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature'
+          {
+            echo 'Las solicitudes NO usan credenciales ni intentan resolver Cloudflare.'
+            echo 'Se registran códigos, redirecciones, cabeceras públicas relevantes y errores.'
+            echo
+            for url in \
+              'https://example.com/' \
+              'https://cults3d.com/' \
+              "$URL" \
+              'https://challenges.cloudflare.com/' \
+              'https://brunhild.challenges.cloudflare.com/'; do
+              echo "========== $url =========="
+              for family in -4 -6; do
+                echo "--- curl $family ---"
+                headers=$(mktemp)
+                # Sin cookies, sin autenticar; sin seguir redirecciones automáticamente.
+                timeout 20 curl "$family" --http1.1 --max-time 15 -sS -D "$headers" -o /dev/null \
+                  -w 'http_status=%{http_code} remote_ip=%{remote_ip} tls_verify=%{ssl_verify_result} total_s=%{time_total} redirect=%{redirect_url}\n' \
+                  "$url" 2>&1 || true
+                grep -Ei '^(HTTP/|server:|location:|cf-ray:|cf-mitigated:|content-type:|content-length:|date:)' "$headers" || true
+                rm -f "$headers"
+              done
+            done
+          } > resultados/http.txt 2>&1
+          echo 'HTTP finalizado; consultar resultados/http.txt'
+
+      - name: Informe de la prueba
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, pathlib
+          out=pathlib.Path('resultados'); out.mkdir(exist_ok=True)
+          stage='${{ matrix.prueba }}'
+          file=out/(stage+'.txt')
+          body=file.read_text(errors='replace') if file.exists() else ''
+          summary={
+            'version':'V21', 'prueba':stage,
+            'fecha_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'archivo_generado':file.exists(), 'bytes_registro':len(body.encode()),
+            'marcadores':{k:body.lower().count(k) for k in ['403','401','servfail','nxdomain','timed out','verify return code','cf-mitigated','error']},
+            'nota':'Los marcadores son conteos de texto, no conclusiones sobre la causa. No se intentó superar Cloudflare.'
+          }
+          (out/'resumen.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8')
+          print(json.dumps(summary,indent=2,ensure_ascii=False))
+          PY
+
+      - name: Subir artefacto incluso si alguna herramienta falla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v21-cults3d-${{ matrix.prueba }}
+          path: resultados/
+          if-no-files-found: warn
+          retention-days: 14
