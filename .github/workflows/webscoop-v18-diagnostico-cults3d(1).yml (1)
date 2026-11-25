@@ -1,0 +1,87 @@
+name: WebScoop V18 - Diagnostico Cults3D
+run-name: Cults3D - Vista previa y recursos publicos
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: URL publica del modelo de Cults3D
+        required: true
+        default: https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature
+
+permissions:
+  contents: read
+
+jobs:
+  cults-public-diagnostic:
+    name: Inspeccionar pagina y visor de Cults3D
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      MODEL_URL: ${{ inputs.model_url }}
+    steps:
+      - name: Instalar navegador y dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium libgbm1 libnss3 libatk-bridge2.0-0 libx11-xcb1 > /dev/null
+          mkdir -p results
+          npm install --no-save --no-audit --no-fund puppeteer-core@24 > /dev/null
+      - name: Crear inspeccionador publico
+        shell: bash
+        run: |
+          cat > diagnostic.cjs <<'NODE'
+          'use strict';
+          const puppeteer=require('puppeteer-core');
+          const fs=require('fs'),path=require('path'),crypto=require('crypto');
+          const target=process.env.MODEL_URL;
+          const out=path.resolve('results');fs.mkdirSync(out,{recursive:true});
+          function safeJson(s){return JSON.stringify(s,null,2)}
+          function emit(name,data){fs.writeFileSync(path.join(out,name),typeof data==='string'?data:safeJson(data))}
+          const log={target,started:new Date().toISOString(),platform:'Cults3D',pages:[],requests:[],errors:[],responses:[],frames:[],links:[],scriptErrors:[],notes:['Solo diagnostico de contenido accesible sin sesion. No se descargan archivos protegidos ni se resuelven desafios de acceso.']};
+          function brief(u){try{const p=new URL(u);return p.origin+p.pathname}catch{return u.slice(0,512)}}
+          function category(url,type){const u=url.toLowerCase().split('?')[0];if(/\.(stl|3mf|obj|gltf|glb|fbx|ply|step|stp|iges|zip|7z)(?:$|\/)/.test(u))return 'archivo-3d';if(/\.(bin|binz|wasm|ktx2|basis|draco)(?:$|\/)/.test(u))return 'binario';if(/\.(png|jpg|jpeg|webp|avif|gif)(?:$|\/)/.test(u))return 'imagen';if(type==='xhr'||type==='fetch')return 'api';return type}
+          async function main(){
+            let u;try{u=new URL(target);if(u.protocol!=='https:'||!/(^|\.)cults3d\.com$/.test(u.hostname))throw Error('URL no valida');}catch(e){throw Error('La URL debe pertenecer a https://cults3d.com: '+e.message)}
+            let browser;
+            try{
+              browser=await puppeteer.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--enable-webgl','--use-gl=angle','--use-angle=vulkan','--enable-unsafe-swiftshader']});
+              const page=await browser.newPage();await page.setViewport({width:1440,height:900,deviceScaleFactor:1});
+              page.on('request',r=>{if(log.requests.length<3000)log.requests.push({url:brief(r.url()),method:r.method(),type:r.resourceType()})});
+              page.on('requestfailed',r=>{log.errors.push({type:'request',url:brief(r.url()),reason:r.failure()?.errorText})});
+              page.on('pageerror',e=>log.scriptErrors.push(String(e).slice(0,700)));
+              page.on('response',r=>{if(log.responses.length<3000){const h=r.headers();log.responses.push({url:brief(r.url()),status:r.status(),type:category(r.url(),r.request().resourceType()),mime:(h['content-type']||'').slice(0,140),length:h['content-length']||null})}});
+              let navigationError=null;try{await page.goto(target,{waitUntil:'domcontentloaded',timeout:55000})}catch(e){navigationError=String(e)}
+              log.pages.push({url:page.url(),title:await page.title().catch(()=>''),navigationError});
+              await new Promise(r=>setTimeout(r,18000));
+              await page.screenshot({path:path.join(out,'captura-pagina.png'),fullPage:true}).catch(e=>{log.errors.push({type:'screenshot',error:String(e)})});
+              // Solo datos publicos de interfaz y URLs. No se extraen tokens/cookies ni se guardan binarios.
+              const info=await page.evaluate(()=>({
+                 title:document.title,heading:[...document.querySelectorAll('h1')].map(x=>x.textContent.trim()).slice(0,10),
+                 meta:[...document.querySelectorAll('meta[property],meta[name]')].filter(x=>/description|title|image|robots/i.test(x.getAttribute('name')||x.getAttribute('property')||'')).map(x=>({key:x.name||x.getAttribute('property'),value:(x.content||'').slice(0,500)})).slice(0,50),
+                 iframes:[...document.querySelectorAll('iframe')].map(x=>({src:(x.getAttribute('src')||'').slice(0,500),title:(x.title||'').slice(0,100)})).slice(0,25),
+                 visibleText:document.body?.innerText?.slice(0,14000)||'',
+                 anchors:[...document.querySelectorAll('a[href]')].filter(a=>/download|descarg|\.stl|\.3mf|\.obj|3d/i.test((a.textContent||'')+' '+a.href)).map(a=>({text:(a.textContent||'').trim().slice(0,100),href:a.href.split('?')[0]})).slice(0,80)
+              })).catch(e=>({error:String(e)}));
+              emit('contenido-publico.json',info);
+              log.frames=page.frames().map(f=>({url:brief(f.url()),name:f.name()||null}));
+              const tally={};for(const x of log.responses){const key=x.type+' '+x.status;tally[key]=(tally[key]||0)+1}
+              log.summary={finalUrl:page.url(),httpStatuses:[...new Set(log.responses.map(x=>x.status))],responseCounts:tally,files3d:log.responses.filter(x=>x.type==='archivo-3d'),binaries:log.responses.filter(x=>x.type==='binario'),frames:log.frames.length};
+              emit('diagnostico-completo.json',log);
+              let conclusion='';if(/403|access denied|forbidden|blocked|captcha|challenge/i.test(info.visibleText?.slice(0,5000)||'')||log.responses.some(r=>r.status===403&&r.url===brief(target)))conclusion='La pagina parece bloquear el acceso automatizado. No se intenta superar el bloqueo.';else if(log.summary.files3d.length)conclusion='Existen solicitudes a archivos 3D visibles en el navegador. Verificar condiciones de descarga/licencia antes de obtenerlos.';else conclusion='No se han observado descargas de archivos 3D. Esto no demuestra que no exista un visor ni que el archivo sea gratuito.';
+              emit('RESUMEN.txt',['WEB SCOOP V18 - CULTS3D',`URL: ${target}`,`URL final: ${page.url()}`,`Respuestas HTTP: ${log.responses.length}`,`Marcos: ${log.frames.length}`,`Solicitudes de archivos 3D: ${log.summary.files3d.length}`,`Otros binarios: ${log.summary.binaries.length}`,`Errores de red: ${log.errors.length}`,`Errores JavaScript: ${log.scriptErrors.length}`,`Conclusion: ${conclusion}`,'','Consulta diagnostico-completo.json y captura-pagina.png.'].join('\n'));
+              console.log(fs.readFileSync(path.join(out,'RESUMEN.txt'),'utf8'));
+            }finally{if(browser)await browser.close().catch(()=>{})}
+          }
+          main().catch(e=>{fs.mkdirSync(out,{recursive:true});emit('ERROR.txt',String(e.stack||e));console.error(e);process.exitCode=1});
+          NODE
+          node --check diagnostic.cjs
+      - name: Ejecutar diagnostico de Cults3D
+        run: node diagnostic.cjs
+      - name: Guardar informes incluso si hay error
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webscoop-v18-cults3d-diagnostico
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
