@@ -1,0 +1,301 @@
+name: WebScoop V30 - Edge interactivo por Tailscale desde Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Pagina publica de Cults3D para abrir en Edge'
+        type: string
+        required: true
+        default: 'https://cults3d.com/es/modelo-3d/artilugios/support-smartphonr-edition-nature'
+      minutos:
+        description: 'Tiempo para controlar Edge desde el movil'
+        type: choice
+        required: true
+        default: '15'
+        options:
+          - '10'
+          - '15'
+          - '20'
+      ip_publica_esperada:
+        description: 'IP publica ACTUAL del movil (compruebala antes en api.ipify.org)'
+        type: string
+        required: true
+        default: '148.3.58.214'
+
+permissions:
+  contents: read
+
+jobs:
+  escritorio-edge:
+    name: Escritorio privado Edge + registro de red
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      TARGET_URL: ${{ inputs.url }}
+      SESSION_MINUTES: ${{ inputs.minutos }}
+      EXPECTED_PUBLIC_IP: ${{ inputs.ip_publica_esperada }}
+      TAILSCALE_EXIT_NODE: '100.117.20.6'
+      DISPLAY: ':99'
+    steps:
+      - name: Preparar informes
+        run: mkdir -p resultados/fuentes resultados/descargas
+
+      - name: Comprobar los dos secretos necesarios
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VNC_PASS: ${{ secrets.SCALPER_VNC_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$TS_KEY" ]; then
+            echo 'Falta el secreto TAILSCALE_AUTHKEY' >&2; exit 1
+          fi
+          if [ -z "$VNC_PASS" ]; then
+            echo 'Falta el secreto SCALPER_VNC_PASSWORD' >&2; exit 1
+          fi
+          if [[ ! "$VNC_PASS" =~ ^[A-Za-z0-9]{8}$ ]]; then
+            echo 'SCALPER_VNC_PASSWORD debe tener EXACTAMENTE 8 letras o numeros ASCII' >&2; exit 1
+          fi
+          echo 'Secretos presentes (sus valores no se muestran).'
+
+      - name: Instalar Edge, escritorio y noVNC
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates curl gnupg git xvfb xauth openbox x11vnc x11-xserver-utils fonts-liberation python3-venv python3-pip >/dev/null
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/microsoft-edge.gpg >/dev/null
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft-edge.gpg] https://packages.microsoft.com/repos/edge stable main' | sudo tee /etc/apt/sources.list.d/microsoft-edge.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq microsoft-edge-stable >/dev/null
+          git clone -q --depth 1 https://github.com/novnc/noVNC.git "$RUNNER_TEMP/novnc"
+          python3 -m venv "$RUNNER_TEMP/v30-venv"
+          "$RUNNER_TEMP/v30-venv/bin/pip" -q install --disable-pip-version-check websockify
+          mkdir -p "$RUNNER_TEMP/v30-npm"
+          npm install --prefix "$RUNNER_TEMP/v30-npm" --no-save --no-audit --no-fund playwright-core@1.58.2 >/dev/null
+          echo "Edge: $(microsoft-edge --version)" | tee resultados/INSTALACION.txt
+          echo "Node: $(node --version)" | tee -a resultados/INSTALACION.txt
+          echo "noVNC: instalado" | tee -a resultados/INSTALACION.txt
+
+      - name: Conectar el runner a Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+
+      - name: Activar salida por el movil y comprobar IP publica
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAILSCALE_EXIT_NODE" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo 'IP Tailscale invalida' >&2; exit 1
+          fi
+          if [[ ! "$EXPECTED_PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo 'IP publica esperada invalida' >&2; exit 1
+          fi
+          sudo tailscale set --exit-node="$TAILSCALE_EXIT_NODE" --accept-dns=false
+          OBTENIDA=''
+          for intento in 1 2 3 4; do
+            OBTENIDA="$(curl -4 -fsS --max-time 15 https://api.ipify.org || true)"
+            [ "$OBTENIDA" = "$EXPECTED_PUBLIC_IP" ] && break
+            sleep 3
+          done
+          echo "IP publica observada: $OBTENIDA" | tee resultados/VERIFICACION_RED.txt
+          echo "IP publica esperada: $EXPECTED_PUBLIC_IP" | tee -a resultados/VERIFICACION_RED.txt
+          if [ "$OBTENIDA" != "$EXPECTED_PUBLIC_IP" ]; then
+            echo 'ERROR: IP no coincide. No se abrira Cults3D.' | tee -a resultados/VERIFICACION_RED.txt
+            exit 1
+          fi
+          echo 'OK: GitHub sale por el nodo del movil' | tee -a resultados/VERIFICACION_RED.txt
+          RUNNER_TS_IP="$(tailscale ip -4 | head -n1 | tr -d '[:space:]')"
+          if [[ ! "$RUNNER_TS_IP" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo 'No se obtuvo la IP Tailscale del runner' >&2; exit 1
+          fi
+          echo "RUNNER_TS_IP=$RUNNER_TS_IP" >> "$GITHUB_ENV"
+          echo "$RUNNER_TS_IP" > resultados/IP_TAILSCALE_GITHUB.txt
+          echo 'El telefono conserva su IP Tailscale de salida; la IP de GitHub sera distinta.'
+
+      - name: Levantar escritorio privado y publicar enlace de acceso
+        env:
+          VNC_PASS: ${{ secrets.SCALPER_VNC_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          x11vnc -storepasswd "$VNC_PASS" "$RUNNER_TEMP/v30-vnc.pass" >/dev/null 2>&1
+          unset VNC_PASS
+          nohup Xvfb :99 -screen 0 1365x900x24 -nolisten tcp > "$RUNNER_TEMP/v30-Xvfb.log" 2>&1 &
+          sleep 3
+          nohup openbox > "$RUNNER_TEMP/v30-openbox.log" 2>&1 &
+          nohup x11vnc -display :99 -localhost -rfbport 5900 -rfbauth "$RUNNER_TEMP/v30-vnc.pass" -forever -shared -noxdamage -quiet > "$RUNNER_TEMP/v30-x11vnc.log" 2>&1 &
+          sleep 3
+          nohup "$RUNNER_TEMP/v30-venv/bin/websockify" --web "$RUNNER_TEMP/novnc" "$RUNNER_TS_IP:6080" 127.0.0.1:5900 > "$RUNNER_TEMP/v30-websockify.log" 2>&1 &
+          sleep 3
+          if ! curl --noproxy '*' -fsS --max-time 8 "http://$RUNNER_TS_IP:6080/vnc.html" > /dev/null; then
+            echo 'noVNC no responde en la IP privada del runner' >&2
+            tail -n 30 "$RUNNER_TEMP/v30-websockify.log" || true
+            exit 1
+          fi
+          LINK="http://$RUNNER_TS_IP:6080/vnc.html?autoconnect=1&resize=scale"
+          echo '=================================================='
+          echo 'ABRE ESTA DIRECCION DESDE EL MOVIL CON TAILSCALE ACTIVO:'
+          echo "$LINK"
+          echo '=================================================='
+          {
+            echo '## WebScoop V30: Edge controlado desde Android'
+            echo ''
+            echo "**Enlace privado (solo mientras la ejecucion este en curso):** [$LINK]($LINK)"
+            echo ''
+            echo '- Abre el enlace en el movil con Tailscale conectado.'
+            echo '- Contraseña: la que configuraste en SCALPER_VNC_PASSWORD (NO se muestra en GitHub).'
+            echo '- GitHub mantendra el escritorio abierto durante los minutos seleccionados.'
+            echo '- No abras el enlace fuera de tu red privada Tailscale.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Crear monitor de codigo, solicitudes y descargas normales
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/v30-monitor.cjs" <<'NODE'
+          'use strict';
+          const fs=require('node:fs');
+          const path=require('node:path');
+          const crypto=require('node:crypto');
+          const {chromium}=require(path.join(process.env.RUNNER_TEMP,'v30-npm/node_modules/playwright-core'));
+          const ROOT=path.join(process.env.GITHUB_WORKSPACE,'resultados');
+          const TARGET=process.env.TARGET_URL;
+          const MINUTES=Math.max(10,Math.min(20,Number(process.env.SESSION_MINUTES)||15));
+          const MAX_FILES=300, MAX_TOTAL=70*1024*1024, MAX_ITEM=5*1024*1024;
+          const events=[],failures=[],sources=[],downloads=[],errors=[];
+          const jobs=[],digests=new Set(); let total=0;
+          const t0=Date.now();
+          fs.mkdirSync(path.join(ROOT,'fuentes'),{recursive:true});
+          fs.mkdirSync(path.join(ROOT,'descargas'),{recursive:true});
+          function safeUrl(input) {
+            try { const u=new URL(input); return (u.origin+u.pathname).slice(0,750); }
+            catch { return '(URL desconocida)'; }
+          }
+          function safeContent(content) {
+            return String(content)
+              .replace(/(https?:\/\/[^\s"'<>?#]+)\?[^\s"'<>]*/g,'$1?[PARAMETROS_OCULTOS]')
+              .replace(/((?:csrf-token|authenticity_token|access_token|refresh_token|session|api_key|client_secret|password)[^\r\n]{0,80}?(?:value|content)?\s*[=:]\s*["'])[^"']+/gi,'$1[OCULTO]')
+              .replace(/([?&](?:Signature|Expires|Key-Pair-Id|token|authenticity_token|key|code)=)[^\s"'<>;&]+/gi,'$1[OCULTO]');
+          }
+          function cults(url) { try {const h=new URL(url).hostname.toLowerCase();return h==='cults3d.com'||h.endsWith('.cults3d.com');}catch{return false;} }
+          function kind(url,type) {
+            const p=(()=>{try{return new URL(url).pathname.toLowerCase();}catch{return ''}})();
+            const t=type.toLowerCase();
+            if(/\.(?:m?js)$/.test(p)||/javascript|ecmascript/.test(t))return 'js';
+            if(/\.css$/.test(p)||t.includes('text/css'))return 'css';
+            if(/\.json$/.test(p)||t.includes('application/json'))return 'json';
+            if(/\.html?$/.test(p)||t.includes('text/html'))return 'html';
+            return '';
+          }
+          async function observe(response) {
+            const req=response.request();
+            const headers=response.headers();
+            const url=response.url(), type=(headers['content-type']||'').split(';')[0];
+            if(events.length<3000) events.push({at:new Date().toISOString(),method:req.method(),url:safeUrl(url),
+              status:response.status(),contentType:type,
+              location:headers.location?safeUrl(new URL(headers.location,url).href):undefined});
+            if(!cults(url)||response.status()<200||response.status()>=400) return;
+            if(url.includes('/cdn-cgi/challenge-platform/'))return;
+            const ext=kind(url,type);
+            if(!ext||sources.length>=MAX_FILES||total>=MAX_TOTAL)return;
+            const length=Number(headers['content-length']||0);
+            if(length>MAX_ITEM)return;
+            try {
+              const body=await response.body();
+              if(!body.length||body.length>MAX_ITEM||body.length+total>MAX_TOTAL)return;
+              const sha=crypto.createHash('sha256').update(body).digest('hex');
+              if(digests.has(sha))return; digests.add(sha);
+              const name=String(sources.length+1).padStart(4,'0')+'_'+sha.slice(0,12)+'.'+ext;
+              fs.writeFileSync(path.join(ROOT,'fuentes',name),safeContent(body.toString('utf8')),'utf8');
+              sources.push({name,url:safeUrl(url),method:req.method(),type:ext,bytes:body.length}); total+=body.length;
+            }catch(e){if(errors.length<60)errors.push('Recurso '+safeUrl(url)+' '+String(e).slice(0,100));}
+          }
+          async function onDownload(download) {
+            const filename=path.basename(download.suggestedFilename()).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,120)||'descarga.bin';
+            const out=path.join(ROOT,'descargas',String(downloads.length+1).padStart(3,'0')+'_'+filename);
+            const record={filename,url:safeUrl(download.url()),status:'iniciada'};
+            downloads.push(record);
+            try {await download.saveAs(out);record.status='guardada';record.bytes=fs.statSync(out).size;}
+            catch(e){record.status='error';record.error=String(e).slice(0,200);}
+          }
+          function attachPage(page){
+            page.on('download',d=>{jobs.push(onDownload(d));});
+            page.on('pageerror',err=>{if(errors.length<80)errors.push(String(err).slice(0,250));});
+          }
+          async function snapshot(page,label){
+            try {
+              const html=await page.content();
+              fs.writeFileSync(path.join(ROOT,`pagina-${label}.html`),safeContent(html),'utf8');
+              await page.screenshot({path:path.join(ROOT,`pantalla-${label}.png`),timeout:12000});
+            }catch(err){if(errors.length<80)errors.push('Captura '+label+': '+String(err).slice(0,250));}
+          }
+          async function main(){
+            const parsed=new URL(TARGET);
+            if(parsed.protocol!=='https:'||!cults(TARGET))throw new Error('Solo URL HTTPS de Cults3D');
+            const context=await chromium.launchPersistentContext(path.join(process.env.RUNNER_TEMP,'v30-edge-profile'),{
+              channel:'msedge',headless:false,acceptDownloads:true,viewport:null,locale:'es-ES',
+              args:['--no-sandbox','--disable-dev-shm-usage','--window-size=1300,850']});
+            context.on('response',r=>{jobs.push(observe(r));});
+            context.on('requestfailed',r=>{if(failures.length<600)failures.push({url:safeUrl(r.url()),reason:r.failure()?.errorText||'sin detalle'});});
+            context.on('page',attachPage);
+            const page=context.pages()[0] || await context.newPage();
+            attachPage(page);
+            try {await page.goto(TARGET,{waitUntil:'domcontentloaded',timeout:55000});}
+            catch(e){errors.push('Navegacion inicial: '+String(e).slice(0,400));}
+            await snapshot(page,'inicial');
+            console.log('Edge esta disponible para control humano por noVNC.');
+            console.log('Tiempo de interaccion: '+MINUTES+' minutos.');
+            await new Promise(resolve=>setTimeout(resolve,MINUTES*60000));
+            const active=context.pages().filter(p=>!p.isClosed());
+            if(active.length)await snapshot(active[active.length-1],'final');
+            await Promise.allSettled(jobs);
+            const report={version:'V30',start:new Date(t0).toISOString(),end:new Date().toISOString(),
+              target:safeUrl(TARGET),pages:active.map(p=>safeUrl(p.url())),
+              responses:events,failures,sources,downloads,errors,totalSourceBytes:total,
+              note:'Registro sin cookies, cabeceras de autenticacion ni query strings. Descargas iniciadas manualmente.'};
+            fs.writeFileSync(path.join(ROOT,'INFORME_V30.json'),JSON.stringify(report,null,2));
+            fs.writeFileSync(path.join(ROOT,'RESUMEN_V30.md'),[
+              '# WebScoop V30 — Edge interactivo',
+              `- URL: ${safeUrl(TARGET)}`,
+              `- Respuestas HTTP: ${events.length}`,
+              `- Recursos HTML/JS/CSS/JSON guardados: ${sources.length}`,
+              `- Archivos descargados mediante el navegador: ${downloads.filter(x=>x.status==='guardada').length}`,
+              `- Errores de red: ${failures.length}`,
+              `- Paginas finales: ${active.map(p=>safeUrl(p.url())).join(', ')}`,
+              '',
+              'Las URL se registran sin parametros de consulta, tokens ni firmas. No se exporta el perfil de Edge.',
+              'No se automatiza el desafio de Cloudflare: cualquier interaccion es manual.'
+            ].join('\n')+'\n');
+            try{await context.close();}catch{}
+          }
+          main().catch(err=>{
+            fs.writeFileSync(path.join(ROOT,'ERROR_V30.txt'),String(err?.stack||err));
+            console.error('ERROR V30:',String(err));process.exitCode=1;
+          });
+          NODE
+          node --check "$RUNNER_TEMP/v30-monitor.cjs"
+
+      - name: CONTROL REMOTO ACTIVO - Abre noVNC desde Android
+        shell: bash
+        run: |
+          set +e
+          echo "Abre AHORA: http://$RUNNER_TS_IP:6080/vnc.html?autoconnect=1&resize=scale"
+          echo 'Busca este mismo enlace en el paso anterior si no puedes copiarlo.'
+          echo "El control remoto estara activo ${SESSION_MINUTES} minutos desde que abre Edge."
+          node "$RUNNER_TEMP/v30-monitor.cjs" 2>&1 | tee resultados/CONSOLA_V30.txt
+          echo "Monitor finalizado (codigo ${PIPESTATUS[0]})."
+          exit 0
+
+      - name: Adjuntar ZIP de resultados aunque la prueba falle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scalper3D-V30-Edge-Interactivo-Resultados
+          path: resultados/
+          if-no-files-found: warn
+          retention-days: 7
